@@ -1,0 +1,25 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.9.34723.18
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Ventas.Api", "src\Ventas.Api\Ventas.Api.csproj", "{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C01}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Ventas.Tests", "tests\Ventas.Tests\Ventas.Tests.csproj", "{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C02}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C01}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C01}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C01}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C01}.Release|Any CPU.Build.0 = Release|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C02}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C02}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C02}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{6F1D2C4B-8A3E-4B7D-9C21-3E5F7A9B1C02}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

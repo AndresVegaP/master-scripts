@@ -1,0 +1,41 @@
+<!--
+  Directory.Build.props: MSBuild lo detecta solo y aplica estas propiedades a
+  TODOS los .csproj que estan por debajo de esta carpeta. Es el mecanismo
+  estandar para no repetir configuracion proyecto por proyecto (DRY aplicado
+  al build). Si manana quieres activar algo en toda la solucion, se hace aqui.
+-->
+<Project>
+
+  <PropertyGroup>
+    <!-- Version de .NET para todos los proyectos. Al estar aqui, ningun
+         .csproj la repite: se cambia en un solo lugar. -->
+    <TargetFramework>net10.0</TargetFramework>
+
+    <!-- Nullable reference types: el compilador rastrea que puede ser null y
+         avisa cuando olvidas comprobarlo. Convierte la excepcion mas comun de
+         .NET (NullReferenceException) en errores de compilacion. -->
+    <Nullable>enable</Nullable>
+
+    <!-- Usings implicitos: importa automaticamente System, System.Linq, etc. -->
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Todo aviso es un error: el codigo del repo compila SIN avisos y asi se
+         mantiene. Es estricto a proposito; en un proyecto heredado se activa
+         de forma gradual. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!-- Aplica en el build las reglas de estilo del .editorconfig (IDExxxx),
+         no solo dentro del IDE: el estilo deja de ser una opinion en la
+         revision de codigo y pasa a ser parte de la compilacion. -->
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!-- Analizadores de .NET al dia con la version del SDK. -->
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+
+    <!-- Compilacion determinista: dos compilaciones del mismo codigo producen
+         binarios identicos (util en CI). -->
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>

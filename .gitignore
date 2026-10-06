@@ -1,0 +1,19 @@
+# Reportes generados: pueden contener rutas, nombres de SP y código de repos de la empresa.
+# NUNCA versionarlos en este repositorio.
+/reportes/
+/reporte-sp-endpoints.md
+/reporte-sp-endpoints.csv
+*.out/
+
+# Salidas y casos temporales de desarrollo
+_desarrollo/out/
+_desarrollo/adversarial/
+
+# Workspaces locales de VS Code (usa analisis.code-workspace.example como plantilla)
+*.code-workspace
+.vs/
+
+# Sistema operativo
+Thumbs.db
+desktop.ini
+.DS_Store

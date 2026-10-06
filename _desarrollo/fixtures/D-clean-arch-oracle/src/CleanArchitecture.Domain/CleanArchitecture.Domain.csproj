@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    La capa Domain no tiene NI UNA sola dependencia: ni de otros proyectos ni
+    de paquetes NuGet. Esa es la regla mas importante del repositorio y aqui
+    se puede comprobar de un vistazo (y la verifica un test de arquitectura).
+  -->
+
+</Project>

@@ -1,0 +1,7 @@
+Inventario de procedimientos (export de ALL_PROCEDURES, 2026-09-30)
+
+PCK_PRODUCTOS.SP_LISTAR_PRODUCTOS        usado por la pantalla de catálogo
+PCK_PRODUCTOS.SP_OBTENER_PRODUCTO        usado por la ficha de producto
+PCK_PEDIDOS.SP_CONSULTAR_PEDIDO_COMPLETO usado por el detalle de pedido
+PCK_REPORTES.SP_CIERRE_MENSUAL           job contable
+PRC_REPROCESAR_COLA                      sin uso conocido

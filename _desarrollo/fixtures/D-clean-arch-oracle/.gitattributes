@@ -1,0 +1,11 @@
+# Normaliza los finales de linea: en el repositorio siempre LF; en tu disco,
+# los que use tu sistema. Evita diffs enteros por cambiar de Windows a Linux.
+* text=auto
+
+*.cs      text diff=csharp
+*.csproj  text
+*.props   text
+*.json    text
+*.md      text
+*.sh      text eol=lf
+*.db      binary

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Application solo referencia a Domain. No conoce Dapper, ni SQLite, ni
+    ASP.NET Core, ni HTTP. Habla con el exterior a través de interfaces
+    (puertos) que implementa la capa Infrastructure.
+
+    La única dependencia externa es la ABSTRACCIÓN del contenedor de
+    inyección de dependencias, que solo se usa en DependencyInjection.cs para
+    que cada capa registre lo suyo. La alternativa purista sería registrar
+    todo desde la Api; a cambio, esta capa perdería cohesión.
+  -->
+
+  <ItemGroup>
+    <ProjectReference Include="..\CleanArchitecture.Domain\CleanArchitecture.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+  </ItemGroup>
+
+</Project>

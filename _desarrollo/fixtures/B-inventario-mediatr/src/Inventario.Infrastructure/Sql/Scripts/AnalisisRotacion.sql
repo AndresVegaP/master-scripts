@@ -1,0 +1,10 @@
+-- Script de analisis de rotacion para el DBA. La API no lo usa.
+SELECT p.SKU,
+       PCK_INVENTARIO.FN_INDICE_ROTACION(p.ID) AS INDICE
+  FROM PRODUCTOS p
+ WHERE p.ESTADO = 'A';
+
+BEGIN
+  PCK_INVENTARIO.SP_ANALISIS_ROTACION(TRUNC(SYSDATE, 'MM'));
+END;
+/
