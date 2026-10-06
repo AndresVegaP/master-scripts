@@ -11,10 +11,10 @@ Este archivo sirve para que un asistente de IA en VS Code (Claude Code, Copilot 
 
 ## 1. Preparación (la haces tú, una sola vez)
 
-1. Clona este repositorio en el PC de la empresa:
+1. Clona este repositorio en el PC de la empresa, en una ruta corta (por ejemplo `C:\repos`). Los repos de prueba tienen rutas profundas, y Windows limita las rutas a 260 caracteres si no está activado `core.longpaths`:
 
 ```powershell
-git clone https://github.com/AndresVegaP/master-scripts.git
+git -c core.longpaths=true clone https://github.com/AndresVegaP/master-scripts.git C:\repos\master-scripts
 ```
 
 2. Crea un workspace de VS Code con dos carpetas: este repo y el repo de la API que quieres analizar.
