@@ -32,7 +32,7 @@ powershell -ExecutionPolicy Bypass -File .\_desarrollo\compare.ps1
 ```
 
 ## Pendientes
-- **Revisión adversarial**: 5 agentes la ejecutan en paralelo, cada uno con una dimensión: parser C#, rutas, grafo de llamadas, semántica de clasificación, y comportamiento PS 5.1 / escala. Los hallazgos confirmados se incorporan en commits posteriores. Antes de usar el script, revisa el historial de commits.
+- **Revisión adversarial**: 5 agentes la ejecutan en paralelo, cada uno con una dimensión: parser C#, rutas, grafo de llamadas, semántica de clasificación, y comportamiento PS 5.1 / escala. Los hallazgos confirmados se incorporan en versiones posteriores: antes de usar el script, descarga el ZIP más reciente del repo.
 - **Validación sobre un repo real de la empresa**: guiada por `PROMPT-VERIFICACION-EMPRESA.md`.
 - **Idea opcional, no implementada**: un parámetro `-OracleSourcePath` para leer el fuente de los packages (`.pkb`/`.pks`) y mostrar qué SP llaman, dentro de la BD, los SP pendientes.
 

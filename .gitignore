@@ -5,11 +5,14 @@
 /reporte-sp-endpoints.csv
 *.out/
 
+# Copia de archivos modificados en el PC de la empresa (se revisan y se suben a mano)
+cambios-herramienta/
+
 # Salidas y casos temporales de desarrollo
 _desarrollo/out/
 _desarrollo/adversarial/
 
-# Workspaces locales de VS Code (usa analisis.code-workspace.example como plantilla)
+# Workspaces locales de VS Code
 *.code-workspace
 .vs/
 

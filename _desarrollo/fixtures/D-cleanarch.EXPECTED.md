@@ -1,4 +1,4 @@
-# Ground truth: fixture D-clean-arch-oracle
+# Ground truth: fixture D-cleanarch
 
 Copia de `clean-architecture` (minimal APIs con `MapGroup` + métodos estáticos que reciben handlers,
 Application con handlers y puertos, Infrastructure con Dapper) a la que se le inyectaron escenarios
@@ -92,7 +92,7 @@ Totales: 33 filas (DIRECTO 10, DIRECTO_EN_QUERY 6, MIGRADO_LISTO 8, HIJO 6, HIJO
 - `db/analisis/inventario_procedimientos.txt`: archivo .txt.
 - `src/CleanArchitecture.Infrastructure/Queries/Reportes/VentasPorMes_v1.sql`: está en la carpeta Queries e incluido por el glob `EmbeddedResource Include="Queries\**\*.sql"` del .csproj, pero ningún código lo referencia por nombre: PCK_REPORTES.SP_VENTAS_POR_MES_V1 no aparece (ni fila ni huérfana).
 - `src/CleanArchitecture.Infrastructure/bin/Debug/net10.0/Queries/Reportes/VentasPorMes.sql`: mismo nombre de archivo que el .sql referenciado, pero en bin/: PCK_UTIL.FN_NOMBRE_MES_OLD no debe aparecer y el HIJO de ventas debe apuntar al .sql de `src/.../Queries/Reportes/`.
-- `src/CleanArchitecture.Infrastructure/obj/Debug/net10.0/CleanArchitecture.Infrastructure.ProcedimientosGenerados.g.cs`: código generado en obj/ (PCK_GENERADO.SP_DESDE_OBJ, PCK_PRODUCTOS.SP_OBTENER_PRODUCTO).
+- `src/CleanArchitecture.Infrastructure/obj/Debug/net10.0/ProcsGenerados.g.cs`: código generado en obj/ (PCK_GENERADO.SP_DESDE_OBJ, PCK_PRODUCTOS.SP_OBTENER_PRODUCTO).
 - `tests/` (proyectos xUnit): `InMemoryProductRepository.cs` (comentarios con PCK_PRODUCTOS.SP_OBTENER_PRODUCTO y PCK_PRODUCTOS.FN_EXISTE_SKU) y `OracleProcedureNamesTests.cs` (bloque mock PCK_PRUEBAS.SP_MOCK_STOCK y asserts con nombres de SP). Los fakes de tests que implementan IProductRepository/IOrderRepository/INotificationSender no son implementaciones a seguir.
 - Literales SQL entre comillas simples: `'PCK_LEGADO.SP_IMPORTAR_CATALOGO'` (ProductQueries.cs:47) y `'PCK_LEGADO.SP_BAJA_MONEDA'` (ReportQueries.cs:116).
 - Columna `SP_ORIGEN` (ReportQueries.cs:114 y 116): nombre con forma de SP no seguido de "(" ni ";" ni fin de texto: no es llamada. GET /api/reports/monedas queda sin filas.

@@ -21,14 +21,15 @@ El resultado es un `.md` de lectura rápida. Opcionalmente también genera un `.
 
 ## 2. Instalación
 
-1. Copia `Analizar-SpEndpoints.ps1` a cualquier carpeta, por ejemplo `repo/docs/local/scripts/`.
-2. Si lo descargaste de internet o de un correo, desbloquéalo una vez:
+1. Descarga el repositorio como ZIP desde GitHub (*Code > Download ZIP*) y extráelo en una ruta corta, por ejemplo `C:\herramientas\`. Las rutas de los repos de prueba son profundas, y el Explorador de Windows no extrae rutas de más de 260 caracteres.
+2. Para usarlo basta con el archivo `Analizar-SpEndpoints.ps1`. Puedes copiarlo a cualquier carpeta, por ejemplo `repo/docs/local/scripts/`. Las carpetas `_desarrollo/` y los `.md` solo sirven para mantenerlo.
+3. Los archivos descargados de internet quedan marcados como bloqueados. Si tu equipo lo permite, desbloquéalos una vez:
 
 ```powershell
-Unblock-File .\Analizar-SpEndpoints.ps1
+Get-ChildItem -Recurse C:\herramientas\master-scripts-main | Unblock-File
 ```
 
-3. Si la política de ejecución de tu equipo no permite scripts, ejecútalo así (no cambia la configuración del equipo):
+4. Si no puedes desbloquearlos, o la política de ejecución de tu equipo no permite scripts, ejecútalo así (no cambia la configuración del equipo):
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\Analizar-SpEndpoints.ps1

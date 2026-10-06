@@ -1,4 +1,4 @@
-param([string[]]$Names = @('A-ventas-mvc','B-inventario-mediatr','C-legacy-webapi2','D-clean-arch-oracle'), [switch]$NoRun)
+param([string[]]$Names = @('A-ventas-mvc','B-inventario-mediatr','C-legacy-webapi2','D-cleanarch'), [switch]$NoRun)
 $ErrorActionPreference = 'Stop'
 $d = $PSScriptRoot
 $script = Join-Path (Split-Path $d -Parent) 'Analizar-SpEndpoints.ps1'
