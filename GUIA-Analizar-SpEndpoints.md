@@ -61,7 +61,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Analizar-SpEndpoints.ps1
 .\Analizar-SpEndpoints.ps1 -RepoPath C:\repos\mi-api -SwaggerPath https://localhost:5001/swagger/v1/swagger.json
 ```
 
-Si `-OutputPath` apunta a una carpeta, el reporte se crea dentro con el nombre `reporte-sp-endpoints.md`.
+Si `-OutputPath` apunta a una carpeta, el reporte se crea dentro con el nombre `reporte-sp-endpoints.md`. El reporte siempre es `.md`: si indicas otra extensión (p. ej. `reporte.csv`), el script avisa y usa `reporte.md`. Con `-ExportCsv`, el `.csv` se crea al lado, con el mismo nombre.
+
+**Con `-File`** (por ejemplo, con `-ExecutionPolicy Bypass`), PowerShell recibe los parámetros de lista como texto. Escríbelos separados por coma: `-PackagePrefixes PCK_,PKG_,PK_` o `-ExcludePath "src/Legacy/*,*Migrations*"`.
 
 ## 4. Parámetros
 
@@ -76,7 +78,7 @@ Si `-OutputPath` apunta a una carpeta, el reporte se crea dentro con el nombre `
 | `-ExportCsv` | | Desactivado | Genera además un `.csv` (separado por `;`, UTF-8) con todas las filas, la forma de llamada y la traza de métodos. |
 | `-IncludeTrace` | | Desactivado | Agrega al final del `.md` el árbol de métodos recorrido por cada endpoint, para auditar el resultado. |
 | `-SwaggerPath` | | (vacío) | `swagger.json` u `openapi.json` (archivo o URL) para comparar los endpoints documentados con los detectados en el código. |
-| `-MaxDepth` | | `40` | Profundidad máxima del recorrido de llamadas. |
+| `-MaxDepth` | | `40` | Profundidad máxima del recorrido de llamadas. Si algún endpoint la alcanza, el reporte lo indica con la advertencia "Profundidad máxima" (sección 7). |
 
 Ejemplo con prefijos propios:
 
@@ -95,8 +97,9 @@ Ejemplo con prefijos propios:
 | **4. SP llamados directamente** | SP que se ejecutan tal cual, con la forma de llamada (nombre + `CommandType.StoredProcedure`, `BEGIN ... END;`, `CALL`/`EXEC`, `SELECT ... FROM DUAL` o dentro de una query). |
 | **5. Inventario de pendientes** | Lista única de SP pendientes de migrar (llamados directamente + hijos no migrados), ordenada por la cantidad de endpoints que dependen de cada uno. Sirve para **priorizar**. |
 | **6. Endpoints sin SP** | Endpoints que no usan SP, con el motivo (p. ej. "ejecuta 3 consultas SQL sin SP asociado"). |
-| **7. Revisión manual** | SP mencionados solo en comentarios, advertencias (llamadas que no se pudieron conectar y nombres de SP dinámicos) y referencias a SP en código que ningún endpoint alcanza. |
-| **8. Cruce con Swagger** | Solo aparece si usas `-SwaggerPath`. |
+| **7. Revisión manual** | SP mencionados solo en comentarios, advertencias y referencias a SP en código que ningún endpoint alcanza. Las advertencias son: "Llamada no resuelta", "SP dinámico", "Comando no resuelto", "Configuración ambigua", "Asociación ambigua" y "Profundidad máxima". |
+| **8. Cruce con Swagger** | Solo aparece si usas `-SwaggerPath`. Muestra los endpoints documentados que no están en el código, y al revés. Como prefijo de las rutas usa `basePath` (Swagger 2) o la ruta de `servers[0].url` (OpenAPI 3). Si el archivo no se puede leer, el motivo queda escrito en esta sección. |
+| **Metodología** | Carpetas omitidas, archivos de test excluidos y archivos leídos como ANSI (ver 6.6). |
 
 ### Valores de la columna *Tipo*
 
@@ -119,7 +122,7 @@ Detecta estos tipos de endpoint:
 
 - **Controllers de ASP.NET Core**: `[ApiController]`, `[Route]` (también el heredado de un controller base), `[HttpGet("...")]`, `[AcceptVerbs]`, `[Area]`, `[ActionName]`, `[NonAction]`, rutas absolutas `~/` y tokens `[controller]`/`[action]`.
 - **ASP.NET Web API 2** (.NET Framework): `[RoutePrefix]`/`[Route]`, y rutas convencionales tomadas de `MapHttpRoute`. En este caso el verbo se infiere del nombre del método.
-- **Minimal APIs**: `MapGet`/`MapPost`/`MapPut`/`MapDelete`/`MapPatch`/`MapMethods`. Los prefijos de `MapGroup` se combinan aunque el grupo se cree en `Program.cs` y se pase a métodos de extensión.
+- **Minimal APIs**: `MapGet`/`MapPost`/`MapPut`/`MapDelete`/`MapPatch`/`MapMethods`/`Map`. Los prefijos de `MapGroup` se combinan aunque el grupo se cree en `Program.cs` y se pase a métodos de extensión.
 - **Carter**, **FastEndpoints** y **Azure Functions** (`HttpTrigger`).
 
 La ruta se muestra como en Swagger: `GET /api/ventas/{id}`, sin las restricciones (`{id:int}` queda como `{id}`).
@@ -135,6 +138,9 @@ Desde cada endpoint se siguen las llamadas a:
 - clases base: la llamada `base.Metodo()` y los métodos virtuales se resuelven sobre el tipo concreto (template methods);
 - `Lazy<T>.Value`, `IOptions<T>.Value`, casts `((IRepo)x).Metodo()`, diccionarios de estrategias (`_mapa[tipo].Ejecutar()`), fábricas `Func<T>` y `GetRequiredService<T>()`;
 - grupos de métodos pasados como delegados (`ids.Select(_repo.Obtener)`) y funciones locales;
+- propiedades con `get`/`set` (también `=>`), indexadores (`this[...]`), operadores y conversiones `implicit`/`explicit`;
+- implementaciones explícitas de interfaz (`IVentasRepo.Listar()`), genéricos cerrados (`VentasRepo : RepoBase<Venta>`) y bloques `extension(...)` de C# 14;
+- alias (`using Repo = Empresa.Datos.VentasRepo;`) y `global using`;
 - constantes (`const string`, `static readonly`), también en clases de constantes como `StoredProcedures.ListarVentas`;
 - strings interpolados con constantes (`$"{Paquete}.SP_X"`), `string.Format`, `string.Concat` y `AppendFormat`;
 - queries armadas con `StringBuilder` o con `sql += ...`: las piezas se unen en una sola query, incluidos los comentarios SQL que vayan en su propia pieza;
@@ -179,11 +185,20 @@ const string SqlListarVentas = @"
 
 ### 6.5 Qué se excluye
 
-- Las carpetas `bin`, `obj`, `.git`, `.vs`, `node_modules`, `packages`, `TestResults`, `artifacts`, y las de documentación (`docs`, `doc`, `documentation`, `documentación`).
+- Las carpetas `bin`, `obj`, `.git`, `.vs`, `.vscode`, `.idea`, `node_modules`, `TestResults`, `.github`, `.gitlab`, `.azuredevops`, `.claude` y `.config`, en cualquier nivel.
+- Las carpetas `packages` y `artifacts`, solo en la raíz de la carpeta analizada (más adentro pueden ser módulos de código).
+- En las carpetas de documentación (`docs`, `doc`, `documentation`, `documentacion`, `documentación`) se ignoran los `.sql`, `.resx` y `appsettings*.json` (scripts y análisis). Los `.cs` sí se leen, porque puede haber un módulo de código llamado `Docs`. Si no quieres leerlos, exclúyelos con `-ExcludePath`.
 - Los proyectos de test. Se detectan por el `.csproj` (`Microsoft.NET.Test.Sdk`, xUnit, NUnit, MSTest, `IsTestProject`) o por carpetas `test`/`tests`/`*.Tests`.
 - Los archivos generados (`*.g.cs`, `*.Designer.cs`, `AssemblyInfo.cs`).
 - Los `.sql`, `.md` y `.txt` de análisis: un `.sql` solo cuenta si el código C# lo referencia por nombre.
-- Para excluir más carpetas, usa `-ExcludePath`.
+- Para excluir más carpetas, usa `-ExcludePath`. Da lo mismo si el patrón termina en `\` o `/`.
+
+### 6.6 Lectura del código fuente
+
+- **Codificación**: lee UTF-8 (con o sin BOM), UTF-16 y UTF-32. Si un archivo sin BOM no es UTF-8 válido, lo lee como Windows-1252 (ANSI), que es lo habitual en fuentes legacy de Visual Studio. Así se conservan los acentos de los comentarios. La sección *Metodología* lista los archivos leídos así.
+- **Fines de línea**: acepta CRLF, LF y CR solo (archivos de Mac antiguos), por lo que los números de línea coinciden con los del editor.
+- **Directivas `#if`/`#elif`/`#else`**: descarta las ramas que se sabe que son falsas, como `#if false`, `#if !true` o un símbolo con `#undef`. Si la condición depende de símbolos de compilación (`DEBUG`, `NET48`...), se analizan todas las ramas cuando eso deja el código bien formado. Si no, se analiza una sola, de preferencia la del `#else`. Un SP que solo aparece en una rama de `DEBUG` puede quedar en el reporte: revísalo en el archivo:línea indicado.
+- **Nombres con caracteres Unicode** (acentos combinados, NFD): se tratan como parte del identificador.
 
 ## 7. Limitaciones conocidas
 
@@ -193,6 +208,8 @@ const string SqlListarVentas = @"
 | Una clase de opciones (`IOptions<T>`) cuya sección no se puede deducir y cuya clave aparece en varias secciones | Lo deja como advertencia "Configuración ambigua". |
 | Sobrecargas con la misma cantidad de parámetros | Se siguen todas. Es una aproximación conservadora: puede sumar un SP de más, pero no omite ninguno. |
 | Llamadas por reflexión, `dynamic` o delegados guardados en diccionarios | No se siguen. Si el método destino puede llegar a un SP, lo reporta como "Llamada no resuelta". |
+| Un campo delegado al que el constructor le asigna una lambda (`_ejecutar = () => _repo.Listar();`) y que después se invoca (`_ejecutar()`) | No se sigue. El endpoint queda en "Endpoints sin SP" y, si ningún otro endpoint llega a `_repo.Listar`, su SP aparece en la sección 7.3 (referencias no vinculadas). |
+| Ramas `#if` con símbolos de compilación | Ver 6.6: se pueden contar SP de una rama que no se compila en producción. |
 | Varias clases con el mismo nombre de método y receptor de tipo desconocido | Si hay 3 clases o menos, sigue todas las candidatas y marca la fila con &dagger;. Si hay más, lo reporta como advertencia con los posibles destinos. |
 | Sinónimos de Oracle o packages sin el prefijo `PCK_`/`PKG_` | Agrega el prefijo con `-PackagePrefixes`. Un nombre sin prefijo solo se detecta si se ejecuta con `CommandType.StoredProcedure`. |
 | Lógica dentro de la BD (un SP pendiente que llama a otros SP) | El script solo ve el repo. Si un hijo está migrado en el repo, sí se siguen sus nietos. |
@@ -209,6 +226,9 @@ const string SqlListarVentas = @"
 | Un endpoint no aparece | Revisa que el controller o el método `Map*` no esté en una carpeta excluida. Con `-SwaggerPath` puedes ver qué endpoints documentados no se detectaron. |
 | Un SP aparece como "Solo en comentario" | El nombre del SP no está escrito en el código (variable, configuración externa, etc.) o la query no se encontró. Revisa el archivo:línea indicado. |
 | Quiero ver por qué un SP quedó asociado a un endpoint | Ejecuta con `-IncludeTrace` (árbol de métodos) o con `-ExportCsv` (columna `Traza`). |
+| Advertencia "Profundidad máxima" | La cadena de llamadas de ese endpoint es más larga que `-MaxDepth`. Vuelve a ejecutar con un valor mayor, por ejemplo `-MaxDepth 80`. |
+| Los prefijos o exclusiones no se aplican al usar `-File` | Pasa la lista separada por comas en un solo valor: `-PackagePrefixes PCK_,PKG_`. |
+| La sección 8 dice que no se pudo leer el Swagger | Revisa la ruta o la URL. Con una URL `https://localhost`, la API debe estar levantada y el certificado de desarrollo debe ser de confianza. Si no, exporta el `swagger.json` a un archivo y pasa la ruta. |
 
 ## 9. Uso en un pipeline (opcional)
 

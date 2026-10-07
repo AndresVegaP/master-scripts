@@ -19,11 +19,20 @@
   - B: MediatR + Minimal APIs + Carter + FastEndpoints.
   - C: Web API 2 legacy.
   - D: copia de clean-architecture con SP.
-- `adversarial/`: casos creados por la revisión adversarial.
+- `adversarial/`: casos creados por la revisión adversarial. Está en `.gitignore`: queda solo en el equipo de desarrollo.
+- `quickcase.ps1`: ejecuta el script sobre una carpeta y muestra las filas del CSV, los endpoints sin SP y las advertencias.
+- `compile-test.ps1`: compila solo el motor C# para ver los errores con número de línea.
 
 ## Estado
 - Fixtures: 108/108 filas esperadas coinciden en endpoint, SP, hijo, tipo y archivo:línea. También coinciden los endpoints sin SP y las referencias huérfanas.
 - Repo original de clean-architecture (sin SP): detecta 9 endpoints y 0 SP.
+- **Revisión adversarial, ronda 1**: 55 hallazgos. Se corrigieron y verificaron unos 50. Las sobrecargas con la misma cantidad de parámetros se aceptan como aproximación conservadora: se siguen todas.
+- **Revisión adversarial, ronda 2** (5 dimensiones; la carpeta `adversarial/` acumula 207 casos de ambas rondas). Se corrigió lo siguiente:
+  - Lectura: preprocesador `#if`/`#elif`/`#else`, archivos ANSI (Windows-1252), CR solo, identificadores NFD y comentarios dentro de huecos interpolados.
+  - Parser: propiedades, indexadores, operadores, implementaciones explícitas de interfaz, alias, `global using`, bloques `extension(...)` y rutas interpoladas con constantes.
+  - Grafo de llamadas: genéricos cerrados (sustitución en la base), `new X.Query()`, funciones locales y reasignación de variables.
+  - Reporte: CSV con encabezado aunque no haya filas, Swagger con claves duplicadas y `servers`, escape HTML, `-OutputPath` distinto de `.md`, parámetros de lista con `-File`, `-ExcludePath` con separador final, carpetas `docs`/`packages`/`artifacts` y aviso de `-MaxDepth`.
+- **Limitación aceptada**: un campo delegado al que el constructor le asigna una lambda no se sigue (`adversarial/parser/case18`). Está documentada en la guía.
 
 ## Ciclo de cambio
 ```powershell
@@ -32,7 +41,6 @@ powershell -ExecutionPolicy Bypass -File .\_desarrollo\compare.ps1
 ```
 
 ## Pendientes
-- **Revisión adversarial**: 5 agentes la ejecutan en paralelo, cada uno con una dimensión: parser C#, rutas, grafo de llamadas, semántica de clasificación, y comportamiento PS 5.1 / escala. Los hallazgos confirmados se incorporan en versiones posteriores: antes de usar el script, descarga el ZIP más reciente del repo.
 - **Validación sobre un repo real de la empresa**: guiada por `PROMPT-VERIFICACION-EMPRESA.md`.
 - **Idea opcional, no implementada**: un parámetro `-OracleSourcePath` para leer el fuente de los packages (`.pkb`/`.pks`) y mostrar qué SP llaman, dentro de la BD, los SP pendientes.
 
