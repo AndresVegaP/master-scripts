@@ -98,8 +98,10 @@ namespace SPA_NS
 
             var finder = new EndpointFinder(Ix, Fx, Sm, Res);
             Res.Endpoints = finder.Find();
+            foreach (var ep in Res.Endpoints) if (ep.Handler != null) Fx.EntryMethods.Add(ep.Handler.Id);
 
             // pasada global: catalogo de SP migrados en todo el repo (sin marcadores heredados)
+            Ix.TrackRefs = true;
             foreach (var m in Ix.Methods)
             {
                 var ma = Fx.Analyze(m);
@@ -122,17 +124,21 @@ namespace SPA_NS
                 var used = new HashSet<string>();
                 var trace = new List<string>();
                 var unresolved = new HashSet<string>();
+                var warns = new List<Warn>();
                 if (ep.Handler != null)
                 {
-                    var visited = new HashSet<string>();
-                    Dfs(ep, ep.Handler, ep.ExtraMarkers, "ep", 0, new List<string>(), false, visited, items, markers, used, visitedAll, trace, unresolved);
+                    var visited = new Dictionary<string, int>();
+                    Dfs(ep, ep.Handler, ep.ViaType, ep.ExtraMarkers, "ep", 0, new List<string>(), false, visited, items, markers, used, visitedAll, trace, unresolved, warns);
                 }
                 foreach (var it in items) AddToCatalog(it.Fr, it.Dec);
                 perEp[ep.Id] = items; epMarkers[ep.Id] = markers; epUsed[ep.Id] = used;
                 Res.EndpointTraces[ep.Id] = trace;
                 foreach (var u in unresolved)
                     Res.Warnings.Add(new Warn { Category = "Llamada no resuelta", Message = u, EndpointDisplay = ep.Display });
+                foreach (var w in warns.GroupBy(x => x.Category + "|" + x.Message + "|" + (x.Loc != null ? x.Loc.Key : "")).Select(g => g.First()))
+                    Res.Warnings.Add(new Warn { Category = w.Category, Message = w.Message, Loc = w.Loc, EndpointDisplay = ep.Display });
             }
+            Ix.TrackRefs = false;
             foreach (var ep in Res.Endpoints) BuildRows(ep, perEp[ep.Id], epMarkers[ep.Id], epUsed[ep.Id]);
             BuildOrphans(visitedAll);
         }
@@ -163,6 +169,7 @@ namespace SPA_NS
             levels.Add(new KeyValuePair<string, List<Marker>>("const-comment", fr.ConstMarkers));
             levels.Add(new KeyValuePair<string, List<Marker>>("body-comment", fr.Block != null ? fr.Block.Markers : new List<Marker>()));
             levels.Add(new KeyValuePair<string, List<Marker>>("method", ma.MethodMarkers));
+            levels.Add(new KeyValuePair<string, List<Marker>>("method-weak", ma.WeakMarkers));
             levels.Add(new KeyValuePair<string, List<Marker>>("inherited", inherited ?? new List<Marker>()));
             levels.Add(new KeyValuePair<string, List<Marker>>("class", ma.ClassMarkers));
             List<Marker> migr = null;
@@ -230,20 +237,26 @@ namespace SPA_NS
         }
 
         // ------------------------------------------------------------ recorrido
-        void Dfs(Endpoint ep, MethodDecl m, List<Marker> inherited, string inhKey, int depth, List<string> path, bool inferredPath,
-                 HashSet<string> visited, List<RawItem> items, List<Marker> markers, HashSet<string> used, HashSet<string> visitedAll,
-                 List<string> trace, HashSet<string> unresolved)
+        void Dfs(Endpoint ep, MethodDecl m, TypeDecl thisType, List<Marker> inherited, string inhKey, int depth, List<string> path, bool inferredPath,
+                 Dictionary<string, int> visited, List<RawItem> items, List<Marker> markers, HashSet<string> used, HashSet<string> visitedAll,
+                 List<string> trace, HashSet<string> unresolved, List<Warn> warns)
         {
             if (m == null || depth > Opt.MaxDepth) return;
-            string key = m.Id + "|" + inhKey;
-            if (!visited.Add(key)) return;
+            string key = m.Id + "|" + inhKey + "|" + (thisType != null ? thisType.Id : "-");
+            int prevDepth;
+            // se vuelve a visitar si ahora se llega por un camino mas corto (el anterior pudo cortarse por -MaxDepth)
+            if (visited.TryGetValue(key, out prevDepth) && prevDepth <= depth) return;
+            bool firstVisit = !visited.ContainsKey(key);
+            visited[key] = depth;
             visitedAll.Add(m.Id);
             var ma = Fx.Analyze(m);
             var p2 = new List<string>(path); p2.Add(m.DisplayName + (inferredPath ? "*" : ""));
             string traceStr = string.Join(" -> ", p2.ToArray());
-            trace.Add(new string(' ', depth * 2) + m.DisplayName + " (" + m.File.Rel + ":" + m.Line + ")" + (inferredPath ? " [inferido]" : ""));
+            if (firstVisit) trace.Add(new string(' ', Math.Min(depth, 30) * 2) + m.DisplayName + " (" + m.File.Rel + ":" + m.Line + ")" + (inferredPath ? " [inferido]" : ""));
             markers.AddRange(ma.MethodMarkers);
+            markers.AddRange(ma.WeakMarkers);
             foreach (var b in ma.Blocks) markers.AddRange(b.Markers);
+            warns.AddRange(ma.Warnings);
             foreach (var fr in ma.Fragments)
             {
                 if (fr.MessageContext) continue;
@@ -252,25 +265,25 @@ namespace SPA_NS
                 foreach (var u in dec.Used) used.Add(u.Id);
                 items.Add(new RawItem { Fr = fr, Dec = dec, Trace = traceStr, InferredPath = inferredPath });
                 if (fr.HasDynamicSp)
-                    Res.Warnings.Add(new Warn { Category = "SP dinámico", Message = "Nombre de SP armado en tiempo de ejecución (no se puede resolver): " + U.OneLine(fr.Value, 120), Loc = new Location(fr.File, fr.Line), EndpointDisplay = ep.Display });
+                    warns.Add(new Warn { Category = "SP dinámico", Message = "Nombre de SP armado en tiempo de ejecución (no se puede resolver): " + U.OneLine(fr.Value, 120), Loc = new Location(fr.File, fr.Line) });
                 if (dec.Level == "inherited" && dec.Migrated.Count > 1)
-                    Res.Warnings.Add(new Warn { Category = "Asociación ambigua", Message = "La query recibe varios SP desde comentarios de un método llamador: " + string.Join(", ", dec.Migrated.Select(x => x.Sp.Display).ToArray()), Loc = QueryLoc(fr), EndpointDisplay = ep.Display });
+                    warns.Add(new Warn { Category = "Asociación ambigua", Message = "La query recibe varios SP desde comentarios de un método llamador: " + string.Join(", ", dec.Migrated.Select(x => x.Sp.Display).ToArray()), Loc = QueryLoc(fr) });
             }
             List<Marker> nextInh = ma.MethodMarkers.Count > 0 ? ma.MethodMarkers : inherited;
             string nextKey = ma.MethodMarkers.Count > 0 ? m.Id : inhKey;
-            var targets = new List<KeyValuePair<MethodDecl, bool>>();
+            var targets = new List<KeyValuePair<Target, List<Marker>>>();
             foreach (var cs in Ix.Calls(m))
             {
                 if (cs.IsNew) continue;
                 bool inf, unr;
-                var tg = Ix.ResolveCall(m, cs, out inf, out unr);
+                var tg = Ix.ResolveTargets(m, cs, thisType, out inf, out unr);
                 if (unr && tg.Count == 0)
                 {
                     // solo se advierte si alguno de los posibles destinos puede llegar a un SP
                     List<MethodDecl> cands;
                     if (Ix.MethodsByName.TryGetValue(cs.Name, out cands))
                     {
-                        var risky = Ix.FilterArgc(cands.Where(x => !x.IsExtension).ToList(), cs.Argc, false).Where(x => CanReachSp(x, new HashSet<string>())).ToList();
+                        var risky = Ix.FilterArgc(cands.Where(x => !x.IsExtension && !x.IsLocalFunction).ToList(), cs.Argc, false).Where(x => CanReachSp(x, new HashSet<string>())).ToList();
                         if (risky.Count > 0)
                         {
                             string recv = string.Join(".", cs.Receiver.Select(x => x.Name).ToArray());
@@ -279,13 +292,33 @@ namespace SPA_NS
                         }
                     }
                 }
-                foreach (var t in tg) if (t != m) targets.Add(new KeyValuePair<MethodDecl, bool>(t, inf));
+                // documentacion del metodo de la interfaz por la que se resolvio la llamada (/// Migrado de ...)
+                var ifaceMarkers = new List<Marker>();
+                foreach (var x in tg)
+                    if (!x.M.HasBody && x.M.Owner != null && (x.M.Owner.Kind == "interface" || x.M.IsAbstract))
+                        foreach (var mk in Fx.Analyze(x.M).MethodMarkers) if (!ifaceMarkers.Any(y => y.Sp.Key == mk.Sp.Key)) ifaceMarkers.Add(mk);
+                markers.AddRange(ifaceMarkers);
+                foreach (var x in tg)
+                {
+                    if (x.M == m) continue;
+                    x.Inferred |= inf;
+                    targets.Add(new KeyValuePair<Target, List<Marker>>(x, ifaceMarkers.Count > 0 ? ifaceMarkers : null));
+                }
             }
-            foreach (var h in Ix.LinkedHandlers(m)) targets.Add(new KeyValuePair<MethodDecl, bool>(h, false));
+            foreach (var h in Ix.LinkedHandlers(m)) targets.Add(new KeyValuePair<Target, List<Marker>>(h, null));
             foreach (var kv in targets)
             {
-                if (!kv.Key.HasBody) continue;
-                Dfs(ep, kv.Key, nextInh, nextKey, depth + 1, p2, inferredPath || kv.Value, visited, items, markers, used, visitedAll, trace, unresolved);
+                var tgt = kv.Key;
+                if (!tgt.M.HasBody) continue;
+                // tipo concreto del objeto en el destino (para resolver llamadas virtuales sin receptor)
+                TypeDecl nextThis = null;
+                if (tgt.Via != null && tgt.Via.Kind != "interface" && tgt.M.Owner != null && Ix.IsSubtypeOf(tgt.Via, tgt.M.Owner)) nextThis = tgt.Via;
+                else if (tgt.M.Owner != null && tgt.M.Owner.Kind != "interface") nextThis = tgt.M.Owner;
+                if (tgt.M.IsLocalFunction) nextThis = thisType;
+                else if (tgt.M.IsStatic) nextThis = null;
+                var inh = kv.Value ?? nextInh;
+                string ik = kv.Value != null ? "if:" + string.Join(",", kv.Value.Select(x => x.Id).ToArray()) : nextKey;
+                Dfs(ep, tgt.M, nextThis, inh, ik, depth + 1, p2, inferredPath || tgt.Inferred, visited, items, markers, used, visitedAll, trace, unresolved, warns);
             }
         }
 
@@ -310,7 +343,7 @@ namespace SPA_NS
                     if (r) break;
                 }
             }
-            if (!r) foreach (var h in Ix.LinkedHandlers(m)) if (CanReachSp(h, stack)) { r = true; break; }
+            if (!r) foreach (var h in Ix.LinkedHandlers(m)) if (CanReachSp(h.M, stack)) { r = true; break; }
             stack.Remove(m.Id);
             reachMemo[m.Id] = r;
             return r;
@@ -335,7 +368,10 @@ namespace SPA_NS
                     var r = new ResultRow { Ep = ep, Sp = h.Sp, Tipo = "DIRECTO", Loc = h.Loc, Trace = it.Trace, Inferred = it.InferredPath, Origin = fr.Origin };
                     if (fr.OnlyConstRef && fr.Kind == "bare" && (fr.Origin == "const" || fr.Origin == "config" || fr.Origin == "resx"))
                     {
-                        r.Detail = (fr.Origin == "config" ? "valor de configuración en " : fr.Origin == "resx" ? "recurso en " : "constante definida en ") + h.Loc.Key;
+                        if (fr.Origin == "const" && fr.ConstRef != null)
+                            r.Detail = "constante " + (fr.ConstRef.Owner != null ? fr.ConstRef.Owner.Name + "." : "") + fr.ConstRef.Name + " definida en " + fr.ConstRef.File.Rel + ":" + fr.ConstRef.Line;
+                        else
+                            r.Detail = (fr.Origin == "config" ? "valor de configuración en " : fr.Origin == "resx" ? "recurso en " : "constante definida en ") + h.Loc.Key;
                         r.Loc = new Location(fr.File, fr.Line);
                     }
                     else if (fr.Origin == "sqlfile") r.Detail = "archivo .sql usado en " + fr.File.Rel + ":" + fr.Line;
@@ -398,7 +434,8 @@ namespace SPA_NS
             if (rows.Count == 0)
             {
                 int q = items.Count;
-                Res.EndpointNoSpReason[ep.Id] = ep.Handler == null ? "Handler no resuelto" : q > 0 ? "Ejecuta " + q + " consulta(s) SQL sin SP asociado" : "No se detectó acceso a datos ni SP en el flujo";
+                bool dyn = Res.Warnings.Any(w => w.EndpointDisplay == ep.Display && (w.Category == "SP dinámico" || w.Category == "Comando no resuelto" || w.Category == "Llamada no resuelta" || w.Category == "Configuración ambigua"));
+                Res.EndpointNoSpReason[ep.Id] = ep.Handler == null ? "Handler no resuelto" : dyn ? "No se pudo determinar el SP: ver advertencias (sección 7.2)" : q > 0 ? "Ejecuta " + q + " consulta(s) SQL sin SP asociado" : "No se detectó acceso a datos ni SP en el flujo";
             }
         }
 
@@ -480,11 +517,11 @@ namespace SPA_NS
             foreach (var td in Ix.Types)
                 foreach (var mv in td.Members.Values)
                 {
-                    if (Fx.ReferencedConsts.Contains(mv.Id)) continue;
+                    if (Ix.ReferencedConsts.Contains(mv.Id)) continue;
                     string v = Ix.ConstValue(mv);
                     if (v == null) continue;
                     var scan = SqlScan.Scan(v);
-                    foreach (var h in Sm.FindInCode(scan.Blank, scan.Kind == "bare"))
+                    foreach (var h in Sm.FindInCode(scan.Blank, scan.Kind == "bare", scan.Kind == "bare" || scan.Kind == "pure"))
                         Res.Orphans.Add(new OrphanRef { Sp = h.Sp, Loc = new Location(mv.File, mv.Line), Context = td.Name + "." + mv.Name, Kind = "codigo", Detail = "constante no referenciada" });
                 }
             Res.Orphans = Res.Orphans.Where(o => !reportedLocs.Contains(o.Loc.Key) || o.Kind == "comentario")
@@ -498,10 +535,11 @@ namespace SPA_NS
             string name = System.IO.Path.GetFileNameWithoutExtension(path);
             if (Regex.IsMatch(name, @"\.[a-z]{2}(-[A-Za-z]{2,4})?$")) return; // recurso localizado
             Ix.ResxBases.Add(name);
-            foreach (Match mm in Regex.Matches(sf.Text, @"<data\s+name=""(?<k>[^""]+)""[^>]*>\s*<value>(?<v>[\s\S]*?)</value>"))
+            foreach (Match mm in Regex.Matches(sf.Text, @"<data\s+name=""(?<k>[^""]+)""[^>]*>\s*<value>(?<v>[\s\S]*?)</value>(?:\s*<comment>(?<c>[\s\S]*?)</comment>)?"))
             {
                 string v = System.Net.WebUtility.HtmlDecode(mm.Groups["v"].Value);
                 var e = new ResxEntry { FileBase = name, Key = mm.Groups["k"].Value, Value = v, File = sf, Line = sf.LineOf(mm.Groups["v"].Index) };
+                if (mm.Groups["c"].Success) { e.Comment = System.Net.WebUtility.HtmlDecode(mm.Groups["c"].Value); e.CommentLine = sf.LineOf(mm.Groups["c"].Index); }
                 List<ResxEntry> l;
                 if (!Ix.ResxByKey.TryGetValue(e.Key, out l)) { l = new List<ResxEntry>(); Ix.ResxByKey[e.Key] = l; }
                 l.Add(e);

@@ -5,9 +5,10 @@ namespace SPA_NS
     // =====================================================================
     public class SpMatcher
     {
-        public Regex PkgRx, ObjRx, PkgOnlyRx;
+        public Regex PkgRx, ObjRx, PkgOnlyRx, DynRx;
         AnalyzerOptions opt;
         const string Id = @"[A-Za-z][\w$#]*";
+        static readonly HashSet<string> PseudoCols = new HashSet<string>(new string[] { "NEXTVAL", "CURRVAL" }, StringComparer.OrdinalIgnoreCase);
 
         public SpMatcher(AnalyzerOptions o)
         {
@@ -20,6 +21,8 @@ namespace SPA_NS
             PkgRx = new Regex(@"(?<![\w$#.])(?:""?(?<schema>" + Id + @")""?\s*\.\s*)?""?(?<pkg>(?:" + pk + @")[\w$#]+)""?\s*\.\s*""?(?<mem>[A-Za-z_][\w$#]*)""?(?:\s*@\s*(?<link>[A-Za-z][\w$#.]*))?", ro);
             ObjRx = new Regex(@"(?<![\w$#.])(?:""?(?<schema>" + Id + @")""?\s*\.\s*)?""?(?<mem>(?:" + ob + @")[\w$#]+)""?(?:\s*@\s*(?<link>[A-Za-z][\w$#.]*))?", ro);
             PkgOnlyRx = new Regex(@"(?<![\w$#.])(?<pkg>(?:" + pk + @")[\w$#]+)(?!\s*\.\s*[A-Za-z_""])", ro);
+            // nombres armados en tiempo de ejecucion: PCK_X.{?}  PCK_X.SP_{?}  SP_{?}  {?}.SP_X(
+            DynRx = new Regex(@"(?<![\w$#])(?:(?:" + pk + @")[\w$#]*\s*\.\s*[\w$#]*\{\?\}|(?:" + ob + @")[\w$#]*\{\?\}|\{\?\}\s*\.\s*(?:" + ob + @")?[\w$#]*\s*\(|(?:" + pk + @")[\w$#]*\{\?\})", ro);
         }
 
         public bool IsPackageName(string s)
@@ -40,19 +43,24 @@ namespace SPA_NS
             return s;
         }
 
-        // Hits en codigo SQL (texto ya sin comentarios ni literales). requireCall aplica a nombres sueltos.
-        public List<SpHit> FindInCode(string code, bool wholeIsBare)
+        // Hits en codigo SQL (texto ya sin comentarios ni literales).
+        // wholeIsBare: el texto completo es un nombre. allowEnd: un nombre suelto al final del texto cuenta como llamada (bloques/CALL).
+        public List<SpHit> FindInCode(string code, bool wholeIsBare, bool allowEnd)
         {
             var hits = new List<SpHit>();
             var spans = new List<int[]>();
+            var dyn = new List<int[]>();
+            foreach (Match mm in DynRx.Matches(code)) dyn.Add(new int[] { mm.Index, mm.Index + mm.Length });
             foreach (Match mm in PkgRx.Matches(code))
             {
-                // descartar %TYPE / %ROWTYPE
                 int after = mm.Index + mm.Length;
-                if (after < code.Length && code[after] == '%') continue;
+                spans.Add(new int[] { mm.Index, after });
+                // descartar %TYPE / %ROWTYPE, secuencias y nombres incompletos
+                if (after < code.Length && (code[after] == '%' || code[after] == '{')) continue;
+                if (PseudoCols.Contains(mm.Groups["mem"].Value)) continue;
+                if (dyn.Any(d => mm.Index < d[1] && after > d[0])) continue;
                 var sp = Make(mm.Groups["schema"].Value, mm.Groups["pkg"].Value, mm.Groups["mem"].Value, mm.Groups["link"].Value);
                 hits.Add(new SpHit { Sp = sp, Offset = mm.Groups["pkg"].Index });
-                spans.Add(new int[] { mm.Index, mm.Index + mm.Length });
             }
             foreach (Match mm in ObjRx.Matches(code))
             {
@@ -60,11 +68,15 @@ namespace SPA_NS
                 if (overlap) continue;
                 string schema = mm.Groups["schema"].Value;
                 if (IsPackageName(schema)) continue;
+                int after = mm.Index + mm.Length;
+                if (after < code.Length && code[after] == '{') continue;
+                if (dyn.Any(d => mm.Index < d[1] && after > d[0])) continue;
+                if (PseudoCols.Contains(mm.Groups["mem"].Value)) continue;
                 if (!wholeIsBare)
                 {
-                    int a = mm.Index + mm.Length;
+                    int a = after;
                     while (a < code.Length && char.IsWhiteSpace(code[a])) a++;
-                    bool callLike = a >= code.Length || code[a] == '(' || code[a] == ';';
+                    bool callLike = (a < code.Length && code[a] == '(') || (allowEnd && (a >= code.Length || code[a] == ';'));
                     if (!callLike)
                     {
                         string before = code.Substring(0, mm.Index).TrimEnd();
@@ -79,6 +91,8 @@ namespace SPA_NS
             return hits;
         }
 
+        public bool HasDynamic(string code) { return DynRx.IsMatch(code); }
+
         // Menciones en comentarios / texto libre. Empareja "PCK_X ... SP_Y" sueltos.
         public List<SpHit> FindInText(string text)
         {
@@ -86,9 +100,10 @@ namespace SPA_NS
             var spans = new List<int[]>();
             foreach (Match mm in PkgRx.Matches(text))
             {
+                spans.Add(new int[] { mm.Index, mm.Index + mm.Length });
+                if (PseudoCols.Contains(mm.Groups["mem"].Value)) continue;
                 var sp = Make(mm.Groups["schema"].Value, mm.Groups["pkg"].Value, mm.Groups["mem"].Value, mm.Groups["link"].Value);
                 hits.Add(new SpHit { Sp = sp, Offset = mm.Index });
-                spans.Add(new int[] { mm.Index, mm.Index + mm.Length });
             }
             var pkgOnly = new List<Match>();
             foreach (Match mm in PkgOnlyRx.Matches(text))
@@ -135,7 +150,7 @@ namespace SPA_NS
         static readonly Regex BlockRx = new Regex(@"^(?:DECLARE\b[\s\S]*?)?\bBEGIN\b(?<body>[\s\S]*)\bEND\b\s*[\w$#]*\s*$", RegexOptions.IgnoreCase);
         static readonly Regex CallStmtRx = new Regex(@"^(?:[:\w$#.""]+\s*:=\s*)?(?:""?[\w$#]+""?\s*\.\s*){0,2}""?[\w$#]+""?(?:\s*@\s*[\w$#.]+)?\s*(?:\([\s\S]*\))?$", RegexOptions.IgnoreCase);
         static readonly Regex DualRx = new Regex(@"^SELECT\s+(?<cols>[\s\S]+?)\s+FROM\s+(?:SYS\s*\.\s*)?DUAL\s*$", RegexOptions.IgnoreCase);
-        static readonly Regex DualColRx = new Regex(@"^(?:""?[\w$#]+""?\s*\.\s*){0,2}""?[\w$#]+""?(?:\s*@\s*[\w$#.]+)?\s*\([\s\S]*\)(?:\s+(?:AS\s+)?""?[\w$#]+""?)?$", RegexOptions.IgnoreCase);
+        static readonly Regex DualColRx = new Regex(@"^(?:(?:""?[\w$#]+""?\s*\.\s*){1,2}""?[\w$#]+""?(?:\s*@\s*[\w$#.]+)?\s*(?:\([\s\S]*\))?|""?[\w$#]+""?\s*\([\s\S]*\))(?:\s+(?:AS\s+)?""?[\w$#]+""?)?$", RegexOptions.IgnoreCase);
         static readonly Regex RegStartRx = new Regex(@"^\(?\s*(SELECT|INSERT|UPDATE|DELETE|MERGE|WITH|BEGIN|DECLARE|OPEN|TRUNCATE|LOCK)\b", RegexOptions.IgnoreCase);
         static readonly Regex RegAnyRx = new Regex(@"\bSELECT\b[\s\S]+?\bFROM\b|\bINSERT\s+INTO\b|\bUPDATE\s+[\w$#."" ]+?\s+SET\b|\bDELETE\s+FROM\b|\bMERGE\s+INTO\b|\bFROM\s+[\w$#.""]+\s+(?:[\w$#]+\s+)?(?:WHERE|JOIN|INNER|LEFT|RIGHT|ORDER|GROUP)\b", RegexOptions.IgnoreCase);
 
@@ -252,7 +267,8 @@ namespace SPA_NS
         public MethodDecl M;
         public List<Fragment> Fragments = new List<Fragment>();
         public List<MarkerBlock> Blocks = new List<MarkerBlock>();
-        public List<Marker> MethodMarkers = new List<Marker>();
+        public List<Marker> MethodMarkers = new List<Marker>();   // nivel metodo (fuertes)
+        public List<Marker> WeakMarkers = new List<Marker>();     // menciones en logs/excepciones
         public List<Marker> ClassMarkers = new List<Marker>();
         public List<Warn> Warnings = new List<Warn>();
     }
@@ -263,16 +279,22 @@ namespace SPA_NS
         SpMatcher sm;
         int fragSeq = 0, markSeq = 0, blockSeq = 0;
         Dictionary<string, MethodAnalysis> cache = new Dictionary<string, MethodAnalysis>();
-        Dictionary<string, bool> wrapperCache = new Dictionary<string, bool>();
+        Dictionary<string, int> wrapperCache = new Dictionary<string, int>();
         Dictionary<string, List<Marker>> classMarkerCache = new Dictionary<string, List<Marker>>();
-        public Dictionary<string, Fragment> ConstFragments = new Dictionary<string, Fragment>();
-        public HashSet<string> ReferencedConsts = new HashSet<string>();
 
-        static readonly Regex MsgCallee = new Regex(@"^(Log\w*|Write\w*|Trace\w*|Debug\w*|Info|Information|Warn|Warning|Error|Fatal|Critical|Verbose|Print\w*|Assert\w*|Fail|Problem|ValidationProblem|AddError|AddModelError|Append\w*Message)$");
-        static readonly Regex ExecCallee = new Regex(@"^(Query\w*|Execute\w*|CommandDefinition|OracleCommand|SqlCommand|DbCommand|NpgsqlCommand|OleDbCommand|OdbcCommand|ExecSp\w*|Exec\w*)$");
+        static readonly Regex MsgCallee = new Regex(@"^(Log\w*|Write\w*|Trace\w*|Debug\w*|Info|Information|Warn|Warning|Error|Fatal|Critical|Verbose|Print\w*|Assert\w*|Fail|AddError|AddModelError|Append\w*Message)$");
+        static readonly Regex NonCmdCallee = new Regex(@"^(Ok|BadRequest|NotFound|Problem|ValidationProblem|Conflict|Created\w*|Accepted\w*|Content|Json|StatusCode|Redirect\w*|Unauthorized|Forbid|NoContent|UnprocessableEntity|Add|AddParameter|AddWithValue|Equals|Contains|StartsWith|EndsWith|IndexOf|LastIndexOf|Replace|Split|Trim\w*|ToUpper\w*|ToLower\w*|SetValue|SetString|SetInt\w*|Compare|CompareTo|Match|IsMatch|Matches|Matched|Header\w*|AddHeader|TryAdd\w*|Remove|Exists|GetValueOrDefault|TryGetValue|ContainsKey|Parse|TryParse|Cookie\w*|Claim|HasClaim|IsInRole|Redirect|Field|Get\w*Value|Select|Where|Any|All|First\w*|Single\w*|Last\w*|Count|OrderBy\w*|GroupBy)$");
+        public static readonly Regex DapperExec = new Regex(@"^(Query|QueryAsync|QueryFirst|QueryFirstAsync|QueryFirstOrDefault|QueryFirstOrDefaultAsync|QuerySingle|QuerySingleAsync|QuerySingleOrDefault|QuerySingleOrDefaultAsync|QueryMultiple|QueryMultipleAsync|QueryUnbufferedAsync|Execute|ExecuteAsync|ExecuteScalar|ExecuteScalarAsync|ExecuteReader|ExecuteReaderAsync)$");
+        static readonly Regex ExecCallee = new Regex(@"^(Query\w*|Execute\w*|CommandDefinition|OracleCommand|SqlCommand|DbCommand|NpgsqlCommand|OleDbCommand|OdbcCommand)$");
         static readonly Regex SqlFileRx = new Regex(@"[\w./\\-]*?([\w-]+(?:\.[\w-]+)*)\.sql\b", RegexOptions.IgnoreCase);
+        static readonly Regex BuilderCallee = new Regex(@"^(Append|AppendLine|AppendFormat|Insert)$");
+
+        public HashSet<string> EntryMethods = new HashSet<string>();   // handlers de endpoints
 
         public FragmentExtractor(CodeIndex index, SpMatcher matcher) { ix = index; sm = matcher; }
+
+        static bool IsP(List<Token> t, int i, string s) { return i >= 0 && i < t.Count && t[i].Kind == TokKind.Punct && t[i].Text == s; }
+        static bool IsI(List<Token> t, int i) { return i >= 0 && i < t.Count && t[i].Kind == TokKind.Ident; }
 
         public MethodAnalysis Analyze(MethodDecl m)
         {
@@ -295,40 +317,54 @@ namespace SPA_NS
             if (m.BodyEnd > 0 && m.BodyEnd - 1 < t.Count) bodyEndOff = Math.Max(bodyEndOff, t[Math.Min(m.BodyEnd, t.Count) - 1].End);
             // bloques de comentario en el cuerpo
             var bodyComments = f.CommentsBetween(m.BodyStart > 0 ? t[m.BodyStart - 1].End : bodyStartOff, bodyEndOff);
-
             Comment prev = null;
             var curComments = new List<Comment>();
             foreach (var c in bodyComments)
             {
                 if (c.IsPreproc && !Regex.IsMatch(c.Text, @"^\s*#\s*(end)?region", RegexOptions.IgnoreCase)) continue;
                 bool join = prev != null && f.Text.Substring(prev.End, c.Start - prev.End).Trim().Length == 0;
-                if (!join && curComments.Count > 0) { FinishBlock(ma, f, curComments); curComments = new List<Comment>(); }
+                if (!join && curComments.Count > 0) { FinishBlock(ma, m, curComments); curComments = new List<Comment>(); }
                 curComments.Add(c);
                 prev = c;
             }
-            if (curComments.Count > 0) FinishBlock(ma, f, curComments);
+            if (curComments.Count > 0) FinishBlock(ma, m, curComments);
 
-            // fragmentos
+            // fragmentos crudos
+            var raw = new List<Fragment>();
             var locals = ix.Locals(m);
             for (int k = m.BodyStart; k < m.BodyEnd && k < t.Count; k++)
             {
                 var tk = t[k];
                 if (tk.Kind == TokKind.Str)
                 {
-                    var ev = ix.EvalStringExpr(f, k, m.BodyEnd, m.Owner, false);
+                    var ev = ix.EvalStringExpr(f, k, m.BodyEnd, m.Owner, false, m, 0);
                     if (ev != null)
                     {
-                        AddFragment(ma, m, ev, k, Math.Max(k + 1, ev.EndTok), "literal", null);
+                        var fr = RawFragment(ma, m, ev, k, Math.Max(k + 1, ev.EndTok), "literal", null);
+                        if (fr != null) raw.Add(fr);
                         k = Math.Max(k, ev.EndTok - 1);
                     }
                     continue;
                 }
-                if (tk.Kind != TokKind.Ident || U.IsKeyword(tk.Text) && tk.Text != "this") continue;
+                if (tk.Kind != TokKind.Ident || U.IsKeyword(tk.Text) && tk.Text != "this" && tk.Text != "string") continue;
                 if (k > 0 && (t[k - 1].Kind == TokKind.Punct && (t[k - 1].Text == "." || t[k - 1].Text == "?." || t[k - 1].Text == "::"))) continue;
+                // string.Format / string.Concat / sb.AppendFormat: se evaluan como un todo
+                int callEnd;
+                var special = FormatOrConcat(ma, m, k, out callEnd);
+                if (special != null) { raw.Add(special); k = callEnd - 1; continue; }
                 var names = new List<string>();
                 int j = k;
                 while (j < m.BodyEnd && t[j].Kind == TokKind.Ident) { names.Add(t[j].Text); if (IsP(t, j + 1, ".") && j + 2 < t.Count && t[j + 2].Kind == TokKind.Ident) j += 2; else { j++; break; } }
                 if (names.Count == 0) continue;
+                // configuracion: _config["A:B"], GetSection("A")["B"]
+                int cfgEnd;
+                var cfg = ix.ConfigAccess(f, k, m.BodyEnd, out cfgEnd);
+                if (cfg != null)
+                {
+                    var fr = ExternalFragment(m, cfg.Value, cfg.File, cfg.Line, k, cfgEnd, f, tk.Line, "config", null);
+                    if (fr != null) { fr.SpContext = true; ApplyContext(ma, m, fr); if (!fr.Ignored) raw.Add(fr); }
+                    k = cfgEnd - 1; continue;
+                }
                 bool isCall = IsP(t, j, "(") || IsP(t, j, "<");
                 if (isCall) { k = j - 1; continue; }
                 if (names.Count == 1 && (locals.ContainsKey(names[0]) || m.Params.Any(p => p.Name == names[0]))) { continue; }
@@ -338,11 +374,11 @@ namespace SPA_NS
                     string cv = ix.ConstValue(mv);
                     if (cv != null)
                     {
-                        ReferencedConsts.Add(mv.Id);
-                        var ev = ix.EvalStringExpr(f, k, m.BodyEnd, m.Owner, false);
+                        var ev = ix.EvalStringExpr(f, k, m.BodyEnd, m.Owner, false, m, 0);
                         if (ev != null)
                         {
-                            var fr = AddFragment(ma, m, ev, k, Math.Max(j, ev.EndTok), "const", mv);
+                            var fr = RawFragment(ma, m, ev, k, Math.Max(j, ev.EndTok), "const", mv);
+                            if (fr != null) raw.Add(fr);
                             k = Math.Max(k, ev.EndTok - 1);
                         }
                         continue;
@@ -354,35 +390,58 @@ namespace SPA_NS
                         {
                             var qt = mv.File.Toks[q];
                             if (qt.Kind != TokKind.Str) continue;
-                            AddSqlFileFragments(ma, m, qt.Lit.PlainValue(), k, j, f, tk.Line);
+                            foreach (var sf in SqlFileFragments(m, qt.Lit.PlainValue(), k, j, f, tk.Line)) raw.Add(sf);
                         }
                     }
-                    // opciones/configuracion: _opt.Value.SpListar
-                    if (names.Count >= 2) TryConfigLeaf(ma, m, names[names.Count - 1], k, j, f, tk.Line);
-                    k = j - 1; continue;
                 }
                 if (names.Count >= 2)
                 {
                     string key = names[names.Count - 1];
                     string bs = names[names.Count - 2];
                     List<ResxEntry> re;
-                    if (ix.ResxBases.Contains(bs) && ix.ResxByKey.TryGetValue(key, out re))
+                    if (mv == null && ix.ResxBases.Contains(bs) && ix.ResxByKey.TryGetValue(key, out re))
                     {
                         foreach (var r in re.Where(x => string.Equals(x.FileBase, bs, StringComparison.OrdinalIgnoreCase)))
-                            AddExternalFragment(ma, m, r.Value, r.File, r.Line, k, j, f, tk.Line, "resx");
+                        {
+                            var extra = new List<Marker>();
+                            if (!string.IsNullOrEmpty(r.Comment))
+                                foreach (var h in sm.FindInText(r.Comment)) extra.Add(NewMarker(h.Sp, new Location(r.File, r.CommentLine), "const-comment", r.Comment));
+                            var fr = ExternalFragment(m, r.Value, r.File, r.Line, k, j, f, tk.Line, "resx", extra);
+                            if (fr != null) { ApplyContext(ma, m, fr); if (!fr.Ignored) raw.Add(fr); }
+                        }
                     }
-                    else TryConfigLeaf(ma, m, key, k, j, f, tk.Line);
+                    else if (mv == null || mv.InitStart < 0)
+                    {
+                        // opciones IOptions<T>: solo si el receptor es una clase de opciones
+                        var recv = ix.ResolveChain(m, names.Take(names.Count - 1).Select(x => new Seg { Name = x }).ToList(), 0);
+                        bool amb;
+                        var oe = ix.OptionsValue(recv, key, out amb);
+                        if (oe != null && sm.MatchesPattern(oe.Value))
+                        {
+                            var fr = ExternalFragment(m, oe.Value, oe.File, oe.Line, k, j, f, tk.Line, "config", null);
+                            if (fr != null) { fr.SpContext = true; ApplyContext(ma, m, fr); if (!fr.Ignored) raw.Add(fr); }
+                        }
+                        else if (amb)
+                            ma.Warnings.Add(new Warn { Category = "Configuración ambigua", Message = "No se pudo determinar la sección de configuración de " + string.Join(".", names.ToArray()) + " (varias secciones tienen la clave '" + key + "')", Loc = new Location(f, tk.Line) });
+                    }
                 }
                 k = j - 1;
             }
-            // asignar bloque mas cercano a cada fragmento
+
+            // fusionar piezas de un mismo StringBuilder / variable acumulada
+            var merged = MergeBuilders(m, raw);
+            foreach (var fr in merged) Finalize(ma, fr);
+            WarnUnresolvedCommands(ma, m);
+
+            // asignar bloque mas cercano a cada fragmento (dentro del mismo bloque { })
             foreach (var fr in ma.Fragments)
             {
                 MarkerBlock best = null;
                 foreach (var b in ma.Blocks)
                 {
-                    bool cand = b.Start < fr.StartOffset || (b.Start < fr.EndOffset) || (b.Line == fr.EndLine && b.Start >= fr.StartOffset);
+                    bool cand = b.Start < fr.EndOffset || (b.Line == fr.EndLine && b.Start >= fr.StartOffset);
                     if (!cand) continue;
+                    if (b.ScopeOpen >= 0 && !(fr.TokStart > b.ScopeOpen && fr.TokStart < b.ScopeClose)) continue;
                     if (best == null || b.Start > best.Start) best = b;
                 }
                 if (best != null) { fr.Block = best; best.Scoped = true; }
@@ -391,11 +450,21 @@ namespace SPA_NS
             return ma;
         }
 
-        void FinishBlock(MethodAnalysis ma, SourceFile f, List<Comment> cs)
+        void FinishBlock(MethodAnalysis ma, MethodDecl m, List<Comment> cs)
         {
             var b = new MarkerBlock { Start = cs[0].Start, End = cs[cs.Count - 1].End, Line = cs[0].Line, EndLine = cs[cs.Count - 1].EndLine, Id = "B" + (++blockSeq) };
             AddTextMarkers(b.Markers, cs, "body-comment");
-            if (b.Markers.Count > 0) ma.Blocks.Add(b);
+            if (b.Markers.Count == 0) return;
+            // alcance: el bloque { } que contiene al comentario
+            var t = m.File.Toks; var mt = m.File.Match;
+            int after = m.BodyStart;
+            while (after < m.BodyEnd && t[after].Start < b.End) after++;
+            for (int k = after - 1; k >= m.BodyStart; k--)
+            {
+                if (IsP(t, k, "}") && mt[k] >= 0 && mt[k] < k) { k = mt[k]; continue; }
+                if (IsP(t, k, "{") && mt[k] > k) { b.ScopeOpen = k; b.ScopeClose = mt[k]; break; }
+            }
+            ma.Blocks.Add(b);
         }
 
         void AddTextMarkers(List<Marker> into, List<Comment> cs, string source)
@@ -443,76 +512,238 @@ namespace SPA_NS
             return r;
         }
 
-        static bool IsP(List<Token> t, int i, string s) { return i >= 0 && i < t.Count && t[i].Kind == TokKind.Punct && t[i].Text == s; }
-
-        Fragment AddFragment(MethodAnalysis ma, MethodDecl m, CodeIndex.StrEval ev, int tokStart, int tokEnd, string origin, MemberVar constRef)
+        // ------------------------------------------------------------ fragmentos crudos
+        Fragment NewFragment(MethodDecl m, CodeIndex.StrEval ev, int tokStart, int tokEnd, string origin)
         {
             var f = m.File; var t = f.Toks;
-            var fr = new Fragment
+            return new Fragment
             {
                 Id = "F" + (++fragSeq), Value = ev.Value, Pieces = ev.Pieces, Method = m, File = f,
                 TokStart = tokStart, TokEnd = tokEnd, Line = t[tokStart].Line, EndLine = t[Math.Min(tokEnd, t.Count) - 1].EndLine,
                 StartOffset = t[tokStart].Start, EndOffset = t[Math.Min(tokEnd, t.Count) - 1].End, Origin = origin
             };
-            if (constRef != null && tokEnd - tokStart <= 2 * 6 && ev.Pieces.All(p => p.Const != null)) { fr.OnlyConstRef = true; fr.ConstRef = constRef; }
-            // contexto de la invocacion que contiene el fragmento
+        }
+
+        Fragment RawFragment(MethodAnalysis ma, MethodDecl m, CodeIndex.StrEval ev, int tokStart, int tokEnd, string origin, MemberVar constRef)
+        {
+            var fr = NewFragment(m, ev, tokStart, tokEnd, origin);
+            if (constRef != null && ev.Pieces.All(p => p.Const != null || p.ExternalKind != null))
+            {
+                fr.OnlyConstRef = true;
+                fr.ConstRef = ev.OuterConst ?? constRef;
+            }
+            if (constRef != null) foreach (var pc in ev.Pieces) if (pc.Const != null) AddConstMarkers(fr, pc.Const);
+            if (ev.OuterConst != null && fr.ConstRef == null) fr.ConstRef = ev.OuterConst;
+            ApplyContext(ma, m, fr);
+            if (fr.Ignored) return null;
+            if (fr.MessageContext)
+            {
+                foreach (var h in sm.FindInText(fr.Value))
+                    ma.WeakMarkers.Add(NewMarker(h.Sp, fr.LocOfValueOffset(h.Offset), "log", fr.Value));
+                return null;
+            }
+            return fr;
+        }
+
+        // Contexto de uso del string: log/excepcion, comando SQL, dato (comparacion, parametro, respuesta), StringBuilder
+        void ApplyContext(MethodAnalysis ma, MethodDecl m, Fragment fr)
+        {
+            var f = m.File; var t = f.Toks; var mt = f.Match;
+            int tokStart = fr.TokStart, tokEnd = fr.TokEnd;
+            // comparaciones
+            if (IsP(t, tokStart - 1, "==") || IsP(t, tokStart - 1, "!=") || IsP(t, tokEnd, "==") || IsP(t, tokEnd, "!=") || (IsI(t, tokStart - 1) && t[tokStart - 1].Text == "case")) { fr.Ignored = true; return; }
+            // inicializador de objeto anonimo / propiedad: new { a = "..." }  new X { Prop = "..." }
+            if (IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 2) && (IsP(t, tokStart - 3, "{") || IsP(t, tokStart - 3, ",")))
+            {
+                string prop = t[tokStart - 2].Text;
+                int k = tokStart - 3;
+                while (k >= m.BodyStart && !(IsP(t, k, "{") && mt[k] > tokStart)) { if ((IsP(t, k, ")") || IsP(t, k, "]") || IsP(t, k, "}")) && mt[k] >= 0 && mt[k] < k) k = mt[k]; k--; }
+                if (k >= m.BodyStart && IsP(t, k, "{"))
+                {
+                    bool objInit = (IsI(t, k - 1) && t[k - 1].Text == "new") || IsI(t, k - 1) || IsP(t, k - 1, ">") || IsP(t, k - 1, ")");
+                    if (objInit && prop != "CommandText" && prop != "Sql" && prop != "Query" && prop != "Text") { fr.Ignored = true; return; }
+                    if (prop == "CommandText" && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
+                }
+            }
             string callee; bool isNew; int argIndex; string namedArg; int open;
             EnclosingCall(m, tokStart, tokEnd, out callee, out isNew, out argIndex, out namedArg, out open);
             if (callee != null)
             {
                 bool logRecv = false;
-                if (open > 1 && IsP(t, open - 2, ".")) { var recv = ix.WalkBack(f, open - 2); logRecv = recv.Any(s => s.Name.IndexOf("log", StringComparison.OrdinalIgnoreCase) >= 0 || s.Name == "Console" || s.Name == "Debug" || s.Name == "Trace"); }
-                if ((isNew && callee.EndsWith("Exception")) || (!isNew && MsgCallee.IsMatch(callee) && (logRecv || !callee.StartsWith("Append"))) || logRecv) fr.MessageContext = true;
-                if (!fr.MessageContext)
+                List<Seg> recv = null;
+                if (open > 1 && IsP(t, open - 2, ".")) { recv = ix.WalkBack(f, open - 2); logRecv = recv.Any(s => s.Name.IndexOf("log", StringComparison.OrdinalIgnoreCase) >= 0 || s.Name == "Console" || s.Name == "Debug" || s.Name == "Trace"); }
+                if ((isNew && callee.EndsWith("Exception")) || (!isNew && MsgCallee.IsMatch(callee)) || logRecv) { fr.MessageContext = true; return; }
+                if (isNew && callee == "StringBuilder" && argIndex == 0)
                 {
-                    bool firstArg = argIndex == 0 || (namedArg != null && Regex.IsMatch(namedArg, @"^(sql|commandText|query|spName|procedure\w*|storedProcedure\w*|nombreSp|sp)$", RegexOptions.IgnoreCase));
-                    if (firstArg && ExecCallee.IsMatch(callee) && RangeHasIdent(t, open, f.Match[open], "StoredProcedure")) fr.SpContext = true;
-                    if (firstArg && ExecCallee.IsMatch(callee) && (callee.Contains("Command")) && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
-                    if (!fr.SpContext && !isNew)
+                    // var sb = new StringBuilder("SELECT ...")
+                    int nk = open - 2;
+                    while (nk > m.BodyStart && !(IsI(t, nk) && t[nk].Text == "new")) nk--;
+                    if (IsP(t, nk - 1, "=") && IsI(t, nk - 2)) fr.GroupVar = t[nk - 2].Text;
+                }
+                else if (BuilderCallee.IsMatch(callee) && recv != null && recv.Count >= 1 && !recv[0].IsCall && recv.All(s => !s.IsCall || BuilderCallee.IsMatch(s.Name)))
+                {
+                    // sb.Append(a).Append(b): el grupo es la raiz de la cadena
+                    var rootSegs = recv.TakeWhile(s => !s.IsCall).Select(s => s.Name).ToArray();
+                    if (callee != "Insert" || argIndex == 1) fr.GroupVar = string.Join(".", rootSegs);
+                    fr.GroupAppendLine = callee == "AppendLine";
+                }
+                else if (!isNew && NonCmdCallee.IsMatch(callee) && !ExecCallee.IsMatch(callee)) { fr.Ignored = true; return; }
+                bool firstArg = argIndex == 0 || (namedArg != null && Regex.IsMatch(namedArg, @"^(sql|commandText|query|spName|procedure\w*|storedProcedure\w*|nombreSp|sp)$", RegexOptions.IgnoreCase));
+                if (firstArg && ExecCallee.IsMatch(callee) && RangeHasIdent(t, open, mt[open], "StoredProcedure")) fr.SpContext = true;
+                if (firstArg && ExecCallee.IsMatch(callee) && callee.Contains("Command") && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
+                if (!fr.SpContext && !isNew && fr.GroupVar == null)
+                {
+                    // wrapper del repo: el parametro string termina como texto del comando con CommandType.StoredProcedure
+                    var cs = new CallSite { Name = callee, Argc = ix.CountArgs(f, open), ArgOpen = open };
+                    if (recv != null) cs.Receiver = recv;
+                    bool inf, unr;
+                    foreach (var tg in ix.ResolveCall(m, cs, out inf, out unr))
                     {
-                        // wrapper del repo: metodo con parametro string y CommandType.StoredProcedure
-                        var cs = new CallSite { Name = callee, Argc = ix.CountArgs(f, open), ArgOpen = open };
-                        if (open > 1 && IsP(t, open - 2, ".")) cs.Receiver = ix.WalkBack(f, open - 2);
-                        bool inf, unr;
-                        var targets = ix.ResolveCall(m, cs, out inf, out unr);
-                        foreach (var tg in targets)
-                        {
-                            int sIdx = FirstStringParam(tg);
-                            if (sIdx >= 0 && (argIndex == sIdx || (namedArg != null && tg.Params[sIdx].Name == namedArg)) && IsSpWrapper(tg)) { fr.SpContext = true; break; }
-                        }
+                        int wi = WrapperParamIndex(tg, 0);
+                        if (wi >= 0 && (argIndex == wi || (namedArg != null && tg.Params[wi + (tg.IsExtension ? 1 : 0)].Name == namedArg))) { fr.SpContext = true; break; }
                     }
                 }
             }
             else
             {
-                // cmd.CommandText = "PCK.SP";
-                if (tokStart >= 2 && IsP(t, tokStart - 1, "=") && t[tokStart - 2].Kind == TokKind.Ident && t[tokStart - 2].Text == "CommandText" && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
-                // propiedad de objeto: new X { CommandText = "..." }
+                // cmd.CommandText = "PCK.SP";  sql += "...";  sql = "...";
+                if (tokStart >= 2 && IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 2) && t[tokStart - 2].Text == "CommandText" && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
+                if (tokStart >= 2 && (IsP(t, tokStart - 1, "+=") || (IsP(t, tokStart - 1, "=") && !IsI(t, tokStart - 3) && !IsP(t, tokStart - 3, ".")) || (IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 3) && (t[tokStart - 3].Text == "var" || t[tokStart - 3].Text == "string"))) && IsI(t, tokStart - 2))
+                    fr.GroupVar = t[tokStart - 2].Text;
+                else if (tokStart >= 4 && IsP(t, tokStart - 1, "+") && IsI(t, tokStart - 2) && IsP(t, tokStart - 3, "=") && IsI(t, tokStart - 4) && t[tokStart - 4].Text == t[tokStart - 2].Text)
+                    fr.GroupVar = t[tokStart - 2].Text;
             }
-            if (fr.MessageContext)
+        }
+
+        // string.Format(...), string.Concat(...), sb.AppendFormat(...): un unico fragmento con los argumentos sustituidos
+        Fragment FormatOrConcat(MethodAnalysis ma, MethodDecl m, int k, out int callEnd)
+        {
+            callEnd = k + 1;
+            var f = m.File; var t = f.Toks; var mt = f.Match;
+            int nameTok = -1; bool isConcat = false; string groupVar = null;
+            if ((t[k].Text == "string" || t[k].Text == "String") && IsP(t, k + 1, ".") && IsI(t, k + 2) && (t[k + 2].Text == "Format" || t[k + 2].Text == "Concat") && IsP(t, k + 3, "("))
+            { nameTok = k + 2; isConcat = t[k + 2].Text == "Concat"; }
+            else if (IsP(t, k + 1, ".") && IsI(t, k + 2) && t[k + 2].Text == "AppendFormat" && IsP(t, k + 3, "("))
+            { nameTok = k + 2; groupVar = t[k].Text; }
+            if (nameTok < 0) return null;
+            int open = nameTok + 1;
+            if (mt[open] < open) return null;
+            var args = SplitArgs(f, open);
+            if (args.Count == 0) return null;
+            var vals = new List<CodeIndex.StrEval>();
+            foreach (var a in args) vals.Add(ix.EvalStringExpr(f, a[0], a[1], m.Owner, true, m, 0));
+            var ev = new CodeIndex.StrEval();
+            if (isConcat)
             {
-                foreach (var h in sm.FindInText(fr.Value))
-                    ma.MethodMarkers.Add(NewMarker(h.Sp, fr.LocOfValueOffset(h.Offset), "log", fr.Value));
-                return fr;
+                foreach (var v in vals)
+                {
+                    if (v == null || !v.Complete) { ev.Sb.Append("{?}"); ev.Complete = false; continue; }
+                    int b = ev.Sb.Length;
+                    foreach (var pc in v.Pieces) ev.Pieces.Add(new FragPiece { ValueStart = b + pc.ValueStart, ValueLength = pc.ValueLength, File = pc.File, Line = pc.Line, CountsLines = pc.CountsLines, Const = pc.Const, ExternalKind = pc.ExternalKind });
+                    ev.Sb.Append(v.Value);
+                    ev.HasLiteral = true;
+                    if (ev.OuterConst == null) ev.OuterConst = v.OuterConst;
+                }
             }
-            // referencias a archivos .sql
-            if (SqlFileRx.IsMatch(fr.Value)) AddSqlFileFragments(ma, m, fr.Value, tokStart, tokEnd, f, fr.Line);
-            // referencias a claves de configuracion "Seccion:Clave"
-            ConfigEntry ce;
-            if (fr.Value.Contains(":") && ix.ConfigByPath.TryGetValue(fr.Value.Trim(), out ce))
+            else
             {
-                AddExternalFragment(ma, m, ce.Value, ce.File, ce.Line, tokStart, tokEnd, f, fr.Line, "config");
-                return fr;
+                var fmt = vals[0];
+                if (fmt == null) return null;
+                string sv = fmt.Value;
+                var outSb = new StringBuilder();
+                var pieces = new List<FragPiece>();
+                // sustituir {0},{1}... (los fragmentos del formato conservan su ubicacion aproximada)
+                int last = 0;
+                foreach (Match mm in Regex.Matches(sv, @"\{(\d+)(?:[^}]*)\}"))
+                {
+                    outSb.Append(sv, last, mm.Index - last);
+                    int idx = int.Parse(mm.Groups[1].Value) + 1;
+                    if (idx < vals.Count && vals[idx] != null && vals[idx].Complete) outSb.Append(vals[idx].Value);
+                    else outSb.Append("{?}");
+                    last = mm.Index + mm.Length;
+                }
+                outSb.Append(sv, last, sv.Length - last);
+                ev.Sb.Append(outSb.ToString());
+                foreach (var pc in fmt.Pieces) ev.Pieces.Add(new FragPiece { ValueStart = 0, ValueLength = ev.Sb.Length, File = pc.File, Line = pc.Line, CountsLines = false, Const = pc.Const, ExternalKind = pc.ExternalKind });
+                ev.HasLiteral = true;
             }
-            if (constRef != null)
-                foreach (var pc in ev.Pieces) if (pc.Const != null) AddConstMarkers(fr, pc.Const);
-            Finalize(ma, fr);
+            if (!ev.HasLiteral) return null;
+            callEnd = mt[open] + 1;
+            var fr = NewFragment(m, ev, k, callEnd, "literal");
+            if (groupVar != null) fr.GroupVar = groupVar;
+            else
+            {
+                ApplyContext(ma, m, fr);
+                if (fr.Ignored || fr.MessageContext) return null;
+            }
             return fr;
+        }
+
+        List<int[]> SplitArgs(SourceFile f, int open)
+        {
+            var t = f.Toks; var mt = f.Match;
+            var r = new List<int[]>();
+            int close = mt[open];
+            if (close < 0) return r;
+            int s = open + 1;
+            for (int k = open + 1; k < close; k++)
+            {
+                if (t[k].Kind != TokKind.Punct) continue;
+                string x = t[k].Text;
+                if ((x == "(" || x == "[" || x == "{") && mt[k] > k) { k = mt[k]; continue; }
+                if (x == ",") { r.Add(new int[] { s, k }); s = k + 1; }
+            }
+            if (close > s) r.Add(new int[] { s, close });
+            return r;
+        }
+
+        // Une en orden las piezas de un mismo StringBuilder o variable acumulada (sql += ...)
+        List<Fragment> MergeBuilders(MethodDecl m, List<Fragment> raw)
+        {
+            var result = new List<Fragment>();
+            var groups = new Dictionary<string, List<Fragment>>();
+            foreach (var fr in raw.OrderBy(x => x.TokStart))
+            {
+                if (fr.GroupVar == null) { result.Add(fr); continue; }
+                List<Fragment> l;
+                if (!groups.TryGetValue(fr.GroupVar, out l)) { l = new List<Fragment>(); groups[fr.GroupVar] = l; }
+                l.Add(fr);
+            }
+            foreach (var kv in groups)
+            {
+                var l = kv.Value;
+                if (l.Count == 1) { result.Add(l[0]); continue; }
+                var first = l[0];
+                var sb = new StringBuilder();
+                var pieces = new List<FragPiece>();
+                bool sp = false;
+                MemberVar cref = null;
+                var cm = new List<Marker>();
+                foreach (var fr in l)
+                {
+                    int b = sb.Length;
+                    foreach (var pc in fr.Pieces) pieces.Add(new FragPiece { ValueStart = b + pc.ValueStart, ValueLength = pc.ValueLength, File = pc.File, Line = pc.Line, CountsLines = pc.CountsLines, Const = pc.Const, ExternalKind = pc.ExternalKind });
+                    sb.Append(fr.Value);
+                    if (fr.GroupAppendLine) sb.Append('\n');
+                    sp |= fr.SpContext;
+                    if (cref == null) cref = fr.ConstRef;
+                    foreach (var x in fr.ConstMarkers) if (!cm.Any(y => y.Sp.Key == x.Sp.Key)) cm.Add(x);
+                }
+                var last = l[l.Count - 1];
+                var mf = new Fragment
+                {
+                    Id = "F" + (++fragSeq), Value = sb.ToString(), Pieces = pieces, Method = m, File = m.File,
+                    TokStart = first.TokStart, TokEnd = last.TokEnd, Line = first.Line, EndLine = last.EndLine,
+                    StartOffset = first.StartOffset, EndOffset = last.EndOffset, Origin = "literal", SpContext = sp, ConstRef = cref, GroupVar = kv.Key
+                };
+                mf.ConstMarkers.AddRange(cm);
+                result.Add(mf);
+            }
+            return result.OrderBy(x => x.TokStart).ToList();
         }
 
         void AddConstMarkers(Fragment fr, MemberVar mv)
         {
-            if (fr.ConstMarkers.Any(x => x.Excerpt == "__" + mv.Id)) return;
             var tmp = new List<Marker>();
             AddTextMarkers(tmp, mv.Leading, "const-comment");
             foreach (var x in tmp) if (!fr.ConstMarkers.Any(y => y.Sp.Key == x.Sp.Key)) fr.ConstMarkers.Add(x);
@@ -521,6 +752,20 @@ namespace SPA_NS
         // Clasifica el fragmento y lo agrega si es relevante
         void Finalize(MethodAnalysis ma, Fragment fr)
         {
+            // referencias a archivos .sql dentro del texto
+            if (SqlFileRx.IsMatch(fr.Value) && fr.Value.Length < 300)
+            {
+                foreach (var sf in SqlFileFragments(fr.Method, fr.Value, fr.TokStart, fr.TokEnd, fr.File, fr.Line)) Finalize(ma, sf);
+                return;
+            }
+            // clave de configuracion completa "Seccion:Clave"
+            ConfigEntry ce;
+            if (fr.Value.Contains(":") && !fr.Value.Contains(" ") && ix.ConfigByPath.TryGetValue(fr.Value.Trim(), out ce))
+            {
+                var cf = ExternalFragment(fr.Method, ce.Value, ce.File, ce.Line, fr.TokStart, fr.TokEnd, fr.File, fr.Line, "config", null);
+                if (cf != null) { cf.SpContext = true; Finalize(ma, cf); }
+                return;
+            }
             var scan = SqlScan.Scan(fr.Value);
             fr.Kind = scan.Kind;
             fr.Form = scan.Form;
@@ -531,7 +776,7 @@ namespace SPA_NS
                     fr.InlineMarkers.Add(NewMarker(h.Sp, fr.LocOfValueOffset(cs[0] + h.Offset), "sql-comment", ctext));
             }
             bool bare = scan.Kind == "bare";
-            var hits = sm.FindInCode(scan.Blank, bare);
+            var hits = sm.FindInCode(scan.Blank, bare, bare || scan.Kind == "pure");
             if (bare && hits.Count == 0 && fr.SpContext)
             {
                 string nm = U.StripQuotes(scan.Blank.Trim().TrimEnd(';'));
@@ -542,34 +787,22 @@ namespace SPA_NS
                 if (parts.Length == 3) sp = SpMatcher.Make(parts[0], parts[1], parts[2], link);
                 else if (parts.Length == 2) sp = SpMatcher.Make(null, parts[0], parts[1], link);
                 else if (parts.Length == 1) sp = SpMatcher.Make(null, null, parts[0], link);
-                if (sp != null) hits.Add(new SpHit { Sp = sp, Offset = fr.Value.IndexOf(parts[0], StringComparison.Ordinal) < 0 ? 0 : fr.Value.IndexOf(parts[0], StringComparison.Ordinal) });
-            }
-            if (bare && !fr.SpContext && hits.Count > 0)
-            {
-                // nombre suelto que calza con el patron: es llamada directa igualmente
+                if (sp != null && !nm.Contains("{?}")) hits.Add(new SpHit { Sp = sp, Offset = Math.Max(0, fr.Value.IndexOf(parts[0], StringComparison.Ordinal)) });
             }
             foreach (var h in hits)
             {
                 h.Loc = fr.LocOfValueOffset(h.Offset);
                 fr.Calls.Add(h);
             }
-            if (Regex.IsMatch(scan.Blank, @"(?:" + string.Join("|", ix.Opt.PackagePrefixes.Select(x => Regex.Escape(x)).ToArray()) + @")[\w$#]*\s*\.\s*\{\?\}|\{\?\}\s*\.\s*(?:" + string.Join("|", ix.Opt.ObjectPrefixes.Select(x => Regex.Escape(x)).ToArray()) + @")?[\w$#]*\s*\(", RegexOptions.IgnoreCase))
-                fr.HasDynamicSp = true;
+            if (sm.HasDynamic(scan.Blank)) fr.HasDynamicSp = true;
             bool relevant = fr.Calls.Count > 0 || fr.Kind == "regular" || fr.InlineMarkers.Count > 0 || fr.HasDynamicSp;
             if (fr.Kind == "regular" && fr.Calls.Count == 0 && fr.Value.Trim().Length < 12) relevant = false;
             if (relevant) ma.Fragments.Add(fr);
         }
 
-        void TryConfigLeaf(MethodAnalysis ma, MethodDecl m, string leaf, int tokStart, int tokEnd, SourceFile f, int line)
+        List<Fragment> SqlFileFragments(MethodDecl m, string value, int tokStart, int tokEnd, SourceFile f, int line)
         {
-            List<ConfigEntry> ce;
-            if (!ix.ConfigByLeaf.TryGetValue(leaf, out ce)) return;
-            foreach (var c in ce)
-                if (sm.MatchesPattern(c.Value)) { AddExternalFragment(ma, m, c.Value, c.File, c.Line, tokStart, tokEnd, f, line, "config"); break; }
-        }
-
-        void AddSqlFileFragments(MethodAnalysis ma, MethodDecl m, string value, int tokStart, int tokEnd, SourceFile f, int line)
-        {
+            var r = new List<Fragment>();
             foreach (Match mm in SqlFileRx.Matches(value))
             {
                 string full = mm.Value.Replace('\\', '/');
@@ -587,11 +820,15 @@ namespace SPA_NS
                     if (best.Count > 0) candidates = best;
                 }
                 foreach (var sf in candidates.Distinct())
-                    AddExternalFragment(ma, m, sf.Text, sf, 1, tokStart, tokEnd, f, line, "sqlfile");
+                {
+                    var fr = ExternalFragment(m, sf.Text, sf, 1, tokStart, tokEnd, f, line, "sqlfile", null);
+                    if (fr != null) r.Add(fr);
+                }
             }
+            return r;
         }
 
-        void AddExternalFragment(MethodAnalysis ma, MethodDecl m, string value, SourceFile src, int srcLine, int tokStart, int tokEnd, SourceFile f, int line, string origin)
+        Fragment ExternalFragment(MethodDecl m, string value, SourceFile src, int srcLine, int tokStart, int tokEnd, SourceFile f, int line, string origin, List<Marker> extraMarkers)
         {
             var t = f.Toks;
             var fr = new Fragment
@@ -599,9 +836,51 @@ namespace SPA_NS
                 Id = "F" + (++fragSeq), Value = value ?? "", Method = m, File = f, TokStart = tokStart, TokEnd = Math.Max(tokStart + 1, tokEnd),
                 Line = line, EndLine = line, StartOffset = t[tokStart].Start, EndOffset = t[Math.Min(Math.Max(tokStart + 1, tokEnd), t.Count) - 1].End, Origin = origin, OnlyConstRef = true
             };
-            fr.Pieces.Add(new FragPiece { ValueStart = 0, ValueLength = fr.Value.Length, File = src, Line = srcLine, CountsLines = true, ExternalKind = origin });
-            if (origin == "config") fr.SpContext = true;
-            Finalize(ma, fr);
+            fr.Pieces.Add(new FragPiece { ValueStart = 0, ValueLength = fr.Value.Length, File = src, Line = srcLine, CountsLines = origin != "config", ExternalKind = origin });
+            if (extraMarkers != null) fr.ConstMarkers.AddRange(extraMarkers);
+            return fr;
+        }
+
+        // Comandos Dapper cuyo texto no se puede resolver: se informan como advertencia
+        void WarnUnresolvedCommands(MethodAnalysis ma, MethodDecl m)
+        {
+            var f = m.File; var t = f.Toks; var mt = f.Match;
+            foreach (var cs in ix.Calls(m))
+            {
+                if (cs.IsNew || cs.IsMethodGroup || cs.ArgOpen < 0 || !DapperExec.IsMatch(cs.Name)) continue;
+                if (cs.Receiver.Count == 0) continue;
+                var args = SplitArgs(f, cs.ArgOpen);
+                if (args.Count == 0) continue;
+                // primer argumento (o "sql:" / "commandText:")
+                int[] a0 = args[0];
+                foreach (var a in args) if (IsI(t, a[0]) && IsP(t, a[0] + 1, ":") && Regex.IsMatch(t[a[0]].Text, "^(sql|commandText|command)$", RegexOptions.IgnoreCase)) { a0 = new int[] { a[0] + 2, a[1] }; break; }
+                if (ma.Fragments.Any(fr => fr.TokStart < a0[1] && fr.TokEnd > a0[0])) continue;
+                // CommandDefinition / variable con valor conocido / parametro de un wrapper: no se avisa
+                if (IsI(t, a0[0]) && t[a0[0]].Text == "new") continue;
+                // StringBuilder o variable acumulada: sb.ToString() / sql
+                int r0 = a0[0];
+                if (IsI(t, r0) && t[r0].Text == "this" && IsP(t, r0 + 1, ".")) r0 += 2;
+                if (IsI(t, r0) && ma.Fragments.Any(fr => fr.GroupVar == t[r0].Text)) continue;
+                if (a0[1] - a0[0] == 1 && IsI(t, a0[0]))
+                {
+                    string n = t[a0[0]].Text;
+                    // parametro: en un wrapper lo resuelven sus llamadores; en un endpoint viene de la peticion (dinamico)
+                    if (m.Params.Any(p => p.Name == n) && !EntryMethods.Contains(m.Id)) continue;
+                    LocalInfo li;
+                    if (ix.Locals(m).TryGetValue(n, out li))
+                    {
+                        int declTok = li.ExprTok;
+                        int declEnd = declTok >= 0 ? ix.P(f).FindStmtEnd(declTok, m.BodyEnd) : -1;
+                        if (declTok >= 0 && ma.Fragments.Any(fr => fr.TokStart >= declTok - 3 && fr.TokStart <= declEnd)) continue;
+                        if (ma.Fragments.Any(fr => fr.GroupVar == n)) continue;
+                    }
+                    var mv = ix.ResolveMemberChain(new List<string> { n }, m.Owner);
+                    if (mv != null && ix.ConstValue(mv) != null) continue;
+                }
+                var sb = new StringBuilder();
+                for (int q = a0[0]; q < a0[1] && q < t.Count; q++) sb.Append(t[q].Kind == TokKind.Str ? "\"" + t[q].Lit.PlainValue() + "\"" : t[q].Text);
+                ma.Warnings.Add(new Warn { Category = "Comando no resuelto", Message = cs.Name + "(" + U.OneLine(sb.ToString(), 80) + "): el texto del comando o el nombre del SP se arma en tiempo de ejecución", Loc = new Location(f, cs.Line) });
+            }
         }
 
         void EnclosingCall(MethodDecl m, int tokStart, int tokEnd, out string callee, out bool isNew, out int argIndex, out string namedArg, out int open)
@@ -637,7 +916,6 @@ namespace SPA_NS
             int nn = ni - 1;
             while (nn >= 0 && (IsP(t, nn, ".") || t[nn].Kind == TokKind.Ident) && t[nn].Text != "new") nn--;
             isNew = nn >= 0 && t[nn].Kind == TokKind.Ident && t[nn].Text == "new";
-            // indice de argumento
             argIndex = 0;
             for (int q = open + 1; q < tokStart; q++)
             {
@@ -661,22 +939,44 @@ namespace SPA_NS
             return RangeHasIdent(m.File.Toks, m.BodyStart, m.BodyEnd - 1, id);
         }
 
-        static int FirstStringParam(MethodDecl md)
+        // Indice (sin contar "this") del parametro string que termina como texto de un comando con
+        // CommandType.StoredProcedure (directamente o pasando por otro wrapper). -1 si no es un wrapper.
+        public int WrapperParamIndex(MethodDecl md, int depth)
         {
-            for (int i = 0; i < md.Params.Count; i++)
-            {
-                if (md.Params[i].IsThis) continue;
-                var ty = md.Params[i].Type;
-                if (ty != null && (ty.Name == "string" || ty.Name == "String")) return md.IsExtension ? i - 1 : i;
-            }
-            return -1;
-        }
-
-        public bool IsSpWrapper(MethodDecl md)
-        {
-            bool r;
+            int r;
             if (wrapperCache.TryGetValue(md.Id, out r)) return r;
-            r = FirstStringParam(md) >= 0 && BodyHasIdent(md, "StoredProcedure");
+            wrapperCache[md.Id] = -1;
+            r = -1;
+            if (md.HasBody && depth < 4 && BodyHasIdent(md, "StoredProcedure"))
+            {
+                var t = md.File.Toks; var mt = md.File.Match;
+                for (int i = 0; i < md.Params.Count && r < 0; i++)
+                {
+                    var p = md.Params[i];
+                    if (p.IsThis || p.Type == null || (p.Type.Name != "string" && p.Type.Name != "String")) continue;
+                    for (int k = md.BodyStart; k < md.BodyEnd && k < t.Count; k++)
+                    {
+                        if (!IsI(t, k) || t[k].Text != p.Name || IsP(t, k - 1, ".")) continue;
+                        // CommandText = param
+                        if (IsP(t, k - 1, "=") && IsI(t, k - 2) && t[k - 2].Text == "CommandText") { r = i; break; }
+                        // primer argumento (o sql:/commandText:) de Query*/Execute*/new XCommand(/new CommandDefinition(
+                        bool first = IsP(t, k - 1, "(") || (IsP(t, k - 1, ":") && IsI(t, k - 2) && Regex.IsMatch(t[k - 2].Text, "^(sql|commandText)$", RegexOptions.IgnoreCase));
+                        if (!first || !(IsP(t, k + 1, ",") || IsP(t, k + 1, ")"))) continue;
+                        int open = IsP(t, k - 1, "(") ? k - 1 : -1;
+                        if (open < 0) { int z = k - 2; while (z >= md.BodyStart && !(IsP(t, z, "(") && mt[z] > k)) z--; open = z; }
+                        if (open <= 0 || !IsI(t, open - 1)) continue;
+                        string callee = t[open - 1].Text;
+                        if (ExecCallee.IsMatch(callee)) { r = i; break; }
+                        // otro wrapper del repo
+                        var cs = new CallSite { Name = callee, Argc = ix.CountArgs(md.File, open), ArgOpen = open };
+                        if (open > 1 && IsP(t, open - 2, ".")) cs.Receiver = ix.WalkBack(md.File, open - 2);
+                        bool inf, unr;
+                        foreach (var tg in ix.ResolveCall(md, cs, out inf, out unr)) if (tg != md && WrapperParamIndex(tg, depth + 1) == 0) { r = i; break; }
+                        if (r >= 0) break;
+                    }
+                }
+            }
+            if (r >= 0 && md.IsExtension) r -= 1;
             wrapperCache[md.Id] = r;
             return r;
         }

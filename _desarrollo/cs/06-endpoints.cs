@@ -3,6 +3,12 @@ namespace SPA_NS
     // =====================================================================
     //  DESCUBRIMIENTO DE ENDPOINTS
     // =====================================================================
+    public class ConvRoute
+    {
+        public string Template, DefaultController, DefaultAction;
+        public bool WebApi;
+    }
+
     public class EndpointFinder
     {
         CodeIndex ix;
@@ -10,7 +16,8 @@ namespace SPA_NS
         SpMatcher sm;
         AnalysisResult res;
         int seq = 0;
-        string webApiTemplate, mvcTemplate;
+        List<ConvRoute> convRoutes = new List<ConvRoute>();
+        string fastEndpointsPrefix;
         Dictionary<string, List<KeyValuePair<MethodDecl, CallSite>>> callersByName;
 
         static readonly string[] VerbAttrs = new string[] { "HttpGet", "HttpPost", "HttpPut", "HttpDelete", "HttpPatch", "HttpHead", "HttpOptions" };
@@ -23,6 +30,7 @@ namespace SPA_NS
         {
             var eps = new List<Endpoint>();
             FindConventionalTemplates();
+            FindFastEndpointsPrefix();
             eps.AddRange(Controllers());
             eps.AddRange(MinimalApis());
             eps.AddRange(FastEndpoints());
@@ -35,12 +43,42 @@ namespace SPA_NS
         static bool IsI(List<Token> t, int i) { return i >= 0 && i < t.Count && t[i].Kind == TokKind.Ident; }
 
         // ------------------------------------------------------------ rutas
+        // Quita restricciones/valores por defecto de los parametros: {id:int} {id?} {*slug} {code:regex(^\d{{3}}$)} -> {nombre}
         public static string Normalize(string r)
         {
             if (r == null) r = "";
-            r = r.Replace('\\', '/').Trim();
+            r = r.Trim();
             if (r.StartsWith("~")) r = r.Substring(1);
-            r = Regex.Replace(r, @"\{\*{0,2}([A-Za-z_][\w]*)[^}]*\}", "{$1}");
+            var sb = new StringBuilder();
+            int i = 0;
+            while (i < r.Length)
+            {
+                char c = r[i];
+                if (c == '{' && i + 1 < r.Length && r[i + 1] == '{') { sb.Append('{'); i += 2; continue; }
+                if (c == '}' && i + 1 < r.Length && r[i + 1] == '}') { sb.Append('}'); i += 2; continue; }
+                if (c == '{')
+                {
+                    int j = i + 1;
+                    while (j < r.Length && r[j] == '*') j++;
+                    int ns = j;
+                    while (j < r.Length && (char.IsLetterOrDigit(r[j]) || r[j] == '_')) j++;
+                    string name = r.Substring(ns, j - ns);
+                    // fin del parametro: primera '}' no duplicada
+                    while (j < r.Length)
+                    {
+                        if (r[j] == '}' && j + 1 < r.Length && r[j + 1] == '}') { j += 2; continue; }
+                        if (r[j] == '{' && j + 1 < r.Length && r[j + 1] == '{') { j += 2; continue; }
+                        if (r[j] == '}') break;
+                        j++;
+                    }
+                    sb.Append('{').Append(name).Append('}');
+                    i = j + 1;
+                    continue;
+                }
+                sb.Append(c == '\\' ? '/' : c);
+                i++;
+            }
+            r = sb.ToString();
             r = Regex.Replace(r, @"/{2,}", "/");
             if (!r.StartsWith("/")) r = "/" + r;
             if (r.Length > 1) r = r.TrimEnd('/');
@@ -67,13 +105,35 @@ namespace SPA_NS
         }
 
         static AttrInfo Attr(List<AttrInfo> l, string name) { return l.FirstOrDefault(a => a.Name == name); }
-        static List<AttrInfo> Attrs(List<AttrInfo> l, string name) { return l.Where(a => a.Name == name).ToList(); }
 
-        static string FirstString(AttrInfo a)
+        // valor string de un argumento de atributo (literal, constante o concatenacion de constantes). null si no es string.
+        string ArgString(ArgRef ar, TypeDecl ctx)
         {
-            for (int i = 0; i < a.Positional.Count; i++) if (a.PositionalIsString[i]) return a.Positional[i];
-            string v;
-            if (a.Named.TryGetValue("template", out v)) return v.Trim('"');
+            if (ar == null || ar.File == null) return null;
+            var t = ar.File.Toks;
+            if (ar.E - ar.S == 1 && IsI(t, ar.S) && t[ar.S].Text == "null") return null;
+            var ev = ix.EvalStringExpr(ar.File, ar.S, ar.E, ctx, true);
+            if (ev != null && ev.Complete) return ev.Value;
+            return null;
+        }
+
+        // primera cadena posicional del atributo (plantilla de ruta), evaluando constantes
+        string FirstString(AttrInfo a, TypeDecl ctx)
+        {
+            for (int i = 0; i < a.Positional.Count; i++)
+            {
+                if (a.PositionalIsString[i]) return a.Positional[i];
+                if (i < a.PosArgs.Count) { var v = ArgString(a.PosArgs[i], ctx); if (v != null) return v; }
+            }
+            ArgRef nr;
+            if (a.NamedArgs.TryGetValue("template", out nr)) return ArgString(nr, ctx);
+            return null;
+        }
+
+        string NamedString(AttrInfo a, string name, TypeDecl ctx)
+        {
+            ArgRef nr;
+            if (a.NamedArgs.TryGetValue(name, out nr)) return ArgString(nr, ctx);
             return null;
         }
 
@@ -87,60 +147,102 @@ namespace SPA_NS
                 {
                     if (t[k].Kind != TokKind.Ident) continue;
                     string x = t[k].Text;
-                    if (x != "MapHttpRoute" && x != "MapRoute" && x != "MapControllerRoute") continue;
+                    if (x != "MapHttpRoute" && x != "MapRoute" && x != "MapControllerRoute" && x != "MapAreaControllerRoute") continue;
                     if (!IsP(t, k + 1, "(")) continue;
-                    int c = m.File.Match[k + 1];
-                    string tpl = null;
+                    var args = SplitArgs(m.File, k + 1);
+                    string tpl = null, defCtrl = null, defAct = null;
                     var strs = new List<string>();
-                    for (int q = k + 2; q < c; q++)
+                    for (int ai = 0; ai < args.Count; ai++)
                     {
-                        if (t[q].Kind == TokKind.Str) strs.Add(t[q].Lit.PlainValue());
-                        if (IsI(t, q) && (t[q].Text == "routeTemplate" || t[q].Text == "pattern" || t[q].Text == "url") && IsP(t, q + 1, ":") && q + 2 < c && t[q + 2].Kind == TokKind.Str) tpl = t[q + 2].Lit.PlainValue();
+                        int s = args[ai][0], e = args[ai][1];
+                        string named = null;
+                        if (IsI(t, s) && IsP(t, s + 1, ":")) { named = t[s].Text; s += 2; }
+                        if (IsI(t, s) && t[s].Text == "new")
+                        {
+                            // defaults: new { controller = "Blog", action = "Article" }
+                            for (int q = s; q < e; q++)
+                            {
+                                if (IsI(t, q) && IsP(t, q + 1, "=") && q + 2 < e && t[q + 2].Kind == TokKind.Str)
+                                {
+                                    if (t[q].Text == "controller") defCtrl = t[q + 2].Lit.PlainValue();
+                                    else if (t[q].Text == "action") defAct = t[q + 2].Lit.PlainValue();
+                                }
+                            }
+                            continue;
+                        }
+                        var ev = ix.EvalStringExpr(m.File, s, e, m.Owner, true);
+                        if (ev == null || !ev.Complete) continue;
+                        if (named == "routeTemplate" || named == "pattern" || named == "url" || named == "template") tpl = ev.Value;
+                        else if (named == null) strs.Add(ev.Value);
                     }
-                    if (tpl == null) tpl = strs.FirstOrDefault(s => s.Contains("{controller"));
+                    if (tpl == null) tpl = strs.FirstOrDefault(s => s.Contains("{"));
                     if (tpl == null && strs.Count > 1) tpl = strs[1];
                     if (tpl == null) continue;
-                    if (x == "MapHttpRoute") { if (webApiTemplate == null || (tpl.Contains("api") && !webApiTemplate.Contains("api"))) webApiTemplate = tpl; }
-                    else { if (mvcTemplate == null) mvcTemplate = tpl; }
+                    // valores por defecto inline: {controller=Home}/{action=Index}
+                    var mc = Regex.Match(tpl, @"\{controller=([^}]+)\}");
+                    convRoutes.Add(new ConvRoute { Template = tpl, DefaultController = defCtrl, DefaultAction = defAct, WebApi = x == "MapHttpRoute" });
                 }
             }
-            res.ConventionalTemplate = webApiTemplate ?? mvcTemplate;
+            var general = convRoutes.FirstOrDefault(c => c.Template.Contains("{controller") && c.WebApi) ?? convRoutes.FirstOrDefault(c => c.Template.Contains("{controller"));
+            res.ConventionalTemplate = general != null ? general.Template : null;
+        }
+
+        ConvRoute PickConventional(bool webApi, string ctrl, string action)
+        {
+            var kind = convRoutes.Where(c => c.WebApi == webApi).ToList();
+            if (kind.Count == 0) kind = convRoutes;
+            // ruta dedicada (sin {controller}) cuyos valores por defecto apuntan a este controller/accion
+            var ded = kind.FirstOrDefault(c => !c.Template.Contains("{controller") && c.DefaultController != null
+                && string.Equals(c.DefaultController, ctrl, StringComparison.OrdinalIgnoreCase)
+                && (c.DefaultAction == null || string.Equals(c.DefaultAction, action, StringComparison.OrdinalIgnoreCase)));
+            if (ded != null) return ded;
+            return kind.FirstOrDefault(c => c.Template.Contains("{controller"));
         }
 
         // ------------------------------------------------------------ controllers
+        static bool HasRoutingAttrs(List<AttrInfo> l)
+        {
+            return l.Any(a => VerbAttrs.Contains(a.Name) || a.Name == "Route" || a.Name == "AcceptVerbs");
+        }
+
         List<Endpoint> Controllers()
         {
             var eps = new List<Endpoint>();
             foreach (var td in ix.Types)
             {
                 if (td.Kind != "class" || td.IsAbstract || td.IsStatic) continue;
+                if (td.TypeParams.Count > 0) continue;              // generico abierto: ASP.NET no lo registra
                 if (Attr(td.Attrs, "NonController") != null) continue;
                 var anc = ix.GetAncestorNames(td);
                 bool isWebApi2 = anc.Contains("ApiController") && !anc.Contains("ControllerBase");
                 bool isCtrl = td.Name.EndsWith("Controller") || Attr(td.Attrs, "ApiController") != null || Attr(td.Attrs, "Controller") != null
                               || anc.Contains("Controller") || anc.Contains("ControllerBase") || anc.Contains("ApiController") || anc.Contains("ODataController");
                 if (!isCtrl) continue;
-                if (td.Name.EndsWith("Controller") && anc.Count == 0 && Attr(td.Attrs, "ApiController") == null && Attr(td.Attrs, "Route") == null && Attr(td.Attrs, "RoutePrefix") == null)
-                {
-                    // clase "XController" sin base ni atributos: puede ser un POCO controller, se acepta igual
-                }
+                if (!td.IsPublic) continue;                         // los controllers deben ser publicos
                 string ctrlName = td.Name.EndsWith("Controller") && td.Name.Length > 10 ? td.Name.Substring(0, td.Name.Length - 10) : td.Name;
-                // rutas de clase (heredables)
-                var classTpls = new List<string>();
                 var chain = new List<TypeDecl> { td };
                 chain.AddRange(ix.Ancestors(td).Where(a => a.Kind == "class"));
+                // rutas de clase (heredables). Web API 2: [RoutePrefix] es prefijo y [Route] de clase es plantilla por defecto
+                var classTpls = new List<string>();
+                string routePrefix = null;
                 foreach (var c in chain)
                 {
-                    foreach (var a in c.Attrs.Where(a => a.Name == "Route" || a.Name == "RoutePrefix"))
+                    foreach (var a in c.Attrs.Where(a => a.Name == "Route" || (a.Name == "RoutePrefix" && !isWebApi2)))
                     {
-                        string s = FirstString(a);
+                        string s = FirstString(a, c);
                         if (s != null) classTpls.Add(s);
                     }
                     if (classTpls.Count > 0) break;
                 }
+                if (isWebApi2)
+                    foreach (var c in chain)
+                    {
+                        var rp = c.Attrs.FirstOrDefault(a => a.Name == "RoutePrefix");
+                        if (rp != null) { routePrefix = FirstString(rp, c); break; }
+                    }
                 string area = null;
                 var areaAttr = chain.SelectMany(c => c.Attrs).FirstOrDefault(a => a.Name == "Area");
-                if (areaAttr != null) area = FirstString(areaAttr);
+                if (areaAttr != null) area = FirstString(areaAttr, td);
                 // acciones: propias + heredadas de controllers base del repo
                 var actions = new List<MethodDecl>();
                 var seen = new HashSet<string>();
@@ -148,7 +250,7 @@ namespace SPA_NS
                 {
                     foreach (var md in c.Methods)
                     {
-                        if (md.IsCtor || md.IsStatic || !md.IsPublic || md.IsAbstract || !md.HasBody || md.IsSynthetic) continue;
+                        if (md.IsCtor || md.IsStatic || !md.IsPublic || md.IsAbstract || !md.HasBody || md.IsSynthetic || md.IsLocalFunction) continue;
                         if (Attr(md.Attrs, "NonAction") != null) continue;
                         if (md.Name == "Dispose" || md.Name == "ToString" || md.Name == "Equals" || md.Name == "GetHashCode") continue;
                         string sig = md.Name + "/" + md.Params.Count;
@@ -158,39 +260,55 @@ namespace SPA_NS
                 }
                 foreach (var md in actions)
                 {
+                    // un override sin atributos de ruta hereda los del metodo base (virtual/abstract)
+                    var attrs = md.Attrs;
+                    if (!HasRoutingAttrs(attrs) && md.IsOverride)
+                    {
+                        foreach (var a in ix.Ancestors(md.Owner))
+                        {
+                            var bm = a.Methods.FirstOrDefault(x => x.Name == md.Name && x.Params.Count == md.Params.Count && HasRoutingAttrs(x.Attrs));
+                            if (bm != null) { attrs = bm.Attrs; break; }
+                        }
+                    }
+                    if (attrs.Any(a => a.Name == "NonAction")) continue;
                     var verbsTpls = new List<KeyValuePair<string, string>>();
                     var routeTpls = new List<string>();
                     string actionName = md.Name;
-                    var an = Attr(md.Attrs, "ActionName");
-                    if (an != null && FirstString(an) != null) actionName = FirstString(an);
+                    var an = Attr(attrs, "ActionName");
+                    if (an != null && FirstString(an, md.Owner) != null) actionName = FirstString(an, md.Owner);
                     else if (!isWebApi2 && actionName.EndsWith("Async") && actionName.Length > 5) actionName = actionName.Substring(0, actionName.Length - 5);
-                    foreach (var a in md.Attrs)
+                    foreach (var a in attrs)
                     {
                         if (VerbAttrs.Contains(a.Name))
                         {
                             string v = a.Name.Substring(4).ToUpperInvariant();
-                            verbsTpls.Add(new KeyValuePair<string, string>(v, FirstString(a)));
+                            verbsTpls.Add(new KeyValuePair<string, string>(v, FirstString(a, md.Owner)));
                         }
                         else if (a.Name == "AcceptVerbs")
                         {
-                            string rt; a.Named.TryGetValue("Route", out rt); if (rt != null) rt = rt.Trim('"');
+                            string rt = NamedString(a, "Route", md.Owner);
                             for (int i = 0; i < a.Positional.Count; i++)
                             {
-                                string pv = a.Positional[i];
-                                if (!a.PositionalIsString[i]) { var mm = Regex.Match(pv, @"(Get|Post|Put|Delete|Patch|Head|Options)\b", RegexOptions.IgnoreCase); if (!mm.Success) continue; pv = mm.Value; }
+                                string pv = a.PositionalIsString[i] ? a.Positional[i] : (i < a.PosArgs.Count ? ArgString(a.PosArgs[i], md.Owner) : null);
+                                if (pv == null)
+                                {
+                                    var mm = Regex.Match(a.Positional[i], @"(Get|Post|Put|Delete|Patch|Head|Options)\b", RegexOptions.IgnoreCase);
+                                    if (!mm.Success) continue;
+                                    pv = mm.Value;
+                                }
                                 verbsTpls.Add(new KeyValuePair<string, string>(pv.ToUpperInvariant(), rt));
                             }
                         }
                         else if (a.Name == "Route")
                         {
-                            string s = FirstString(a); if (s != null) routeTpls.Add(s);
+                            string s = FirstString(a, md.Owner); if (s != null) routeTpls.Add(s);
                         }
                     }
                     bool attributeRouted = classTpls.Count > 0 || routeTpls.Count > 0 || verbsTpls.Any(x => x.Value != null);
                     if (verbsTpls.Count == 0)
                     {
                         string v = "ANY";
-                        if (isWebApi2 || !attributeRouted && webApiTemplate != null)
+                        if (isWebApi2)
                         {
                             var mm = Regex.Match(md.Name, @"^(Get|Post|Put|Delete|Patch|Head|Options)");
                             v = mm.Success ? mm.Value.ToUpperInvariant() : "POST";
@@ -200,8 +318,9 @@ namespace SPA_NS
                     var routes = new List<KeyValuePair<string, string>>();
                     if (!attributeRouted)
                     {
-                        string conv = (isWebApi2 ? webApiTemplate : (mvcTemplate ?? webApiTemplate)) ?? (isWebApi2 ? "api/{controller}/{id}" : "api/[controller]");
-                        string r = ConventionalRoute(conv, ctrlName, actionName, md);
+                        var conv = PickConventional(isWebApi2, ctrlName, actionName);
+                        string tpl = conv != null ? conv.Template : (isWebApi2 ? "api/{controller}/{id}" : "api/[controller]");
+                        string r = ConventionalRoute(tpl, ctrlName, actionName, md);
                         foreach (var vt in verbsTpls) routes.Add(new KeyValuePair<string, string>(vt.Key, r));
                     }
                     else
@@ -210,7 +329,13 @@ namespace SPA_NS
                         foreach (var vt in verbsTpls)
                         {
                             var tpls = vt.Value != null ? new List<string> { vt.Value } : (routeTpls.Count > 0 ? routeTpls : new List<string> { null });
-                            foreach (var p in prefixes) foreach (var tp in tpls) routes.Add(new KeyValuePair<string, string>(vt.Key, Combine(p, tp)));
+                            foreach (var p in prefixes)
+                                foreach (var tp in tpls)
+                                {
+                                    string full = Combine(p, tp);
+                                    if (routePrefix != null && !(tp != null && (tp.StartsWith("~/") || tp.StartsWith("/")))) full = Combine(routePrefix, full);
+                                    routes.Add(new KeyValuePair<string, string>(vt.Key, full));
+                                }
                         }
                     }
                     var done = new HashSet<string>();
@@ -222,7 +347,7 @@ namespace SPA_NS
                         if (area != null) r = Regex.Replace(r, @"\[area\]", area, RegexOptions.IgnoreCase);
                         r = Normalize(r);
                         if (!done.Add(vr.Key + " " + r)) continue;
-                        var ep = new Endpoint { Verb = vr.Key, Route = r, Kind = isWebApi2 ? "WebApi2" : "Controller", Handler = md, HandlerName = td.Name + "." + md.Name, File = md.File, Line = md.Line };
+                        var ep = new Endpoint { Verb = vr.Key, Route = r, Kind = isWebApi2 ? "WebApi2" : "Controller", Handler = md, HandlerName = td.Name + "." + md.Name, File = md.File, Line = md.Line, ViaType = td };
                         if (!attributeRouted) ep.Note = "ruta convencional";
                         eps.Add(ep);
                     }
@@ -248,7 +373,7 @@ namespace SPA_NS
 
         // ------------------------------------------------------------ minimal APIs
         static readonly Dictionary<string, string> MapVerbs = new Dictionary<string, string> {
-            { "MapGet", "GET" }, { "MapPost", "POST" }, { "MapPut", "PUT" }, { "MapDelete", "DELETE" }, { "MapPatch", "PATCH" }, { "MapMethods", "*" } };
+            { "MapGet", "GET" }, { "MapPost", "POST" }, { "MapPut", "PUT" }, { "MapDelete", "DELETE" }, { "MapPatch", "PATCH" }, { "MapMethods", "*" }, { "Map", "ANY" } };
 
         List<Endpoint> MinimalApis()
         {
@@ -259,13 +384,11 @@ namespace SPA_NS
                 foreach (var cs in ix.Calls(m))
                 {
                     if (cs.IsNew || cs.IsMethodGroup || !MapVerbs.ContainsKey(cs.Name) || cs.ArgOpen < 0) continue;
+                    if (cs.Receiver.Count == 0) continue;
+                    if (ix.InLocalFunction(m, cs.Tok)) continue;   // se procesa en la propia funcion local
                     var f = m.File; var t = f.Toks;
                     var args = SplitArgs(f, cs.ArgOpen);
                     if (args.Count < 2) continue;
-                    string tpl = "{?}";
-                    var ev = ix.EvalStringExpr(f, args[0][0], args[0][1], m.Owner, true);
-                    if (ev != null) tpl = ev.Value;
-                    else if (args[0][1] - args[0][0] == 1 && t[args[0][0]].Kind == TokKind.Str) tpl = t[args[0][0]].Lit.PlainValue();
                     var verbs = new List<string>();
                     int handlerArg = 1;
                     if (cs.Name == "MapMethods")
@@ -282,7 +405,10 @@ namespace SPA_NS
                     else verbs.Add(MapVerbs[cs.Name]);
                     // handler
                     int hs = args[handlerArg][0], he = args[handlerArg][1];
+                    if (cs.Name == "Map" && !LooksLikeEndpointHandler(t, hs, he)) continue;  // app.Map("/x", b => b.Run(...)) es middleware
                     MethodDecl handler = BuildHandler(m, hs, he);
+                    if (cs.Name == "Map" && handler == null) continue;
+                    var tpls = TemplateValues(m, args[0][0], args[0][1], 0);
                     string hname;
                     if (handler != null && handler.IsSynthetic) hname = m.Owner.Name + "." + (m.IsSynthetic ? "<top-level>" : m.Name) + " -> lambda";
                     else if (handler != null) hname = handler.DisplayName;
@@ -298,24 +424,63 @@ namespace SPA_NS
                         if (c2 < 0) break;
                         z = c2 + 1;
                     }
-                    // marcadores: comentarios antes de la sentencia
-                    var extra = StatementComments(m, cs.Tok - 2 * cs.Receiver.Count);
-                    var prefixes = ReceiverPrefixes(m, cs.Receiver, 0);
+                    int chainStart;
+                    ix.WalkBack(f, cs.Tok - 1, out chainStart);
+                    var extra = StatementComments(m, chainStart);
+                    var prefixes = ReceiverPrefixes(m, cs.Receiver, 0, null);
                     foreach (var pf in prefixes.Distinct())
-                        foreach (var v in verbs)
-                        {
-                            var ep = new Endpoint
+                        foreach (var tpl in tpls)
+                            foreach (var v in verbs)
                             {
-                                Verb = v, Route = Normalize(Join(pf, tpl)), Kind = "MinimalApi", Handler = handler, HandlerName = hname,
-                                File = f, Line = cs.Line, OperationName = opName
-                            };
-                            ep.ExtraMarkers.AddRange(extra);
-                            if (handler == null) res.Warnings.Add(new Warn { Category = "Endpoint", Message = "No se pudo resolver el handler de " + v + " " + ep.Route, Loc = new Location(f, cs.Line) });
-                            eps.Add(ep);
-                        }
+                                var ep = new Endpoint
+                                {
+                                    Verb = v, Route = Normalize(Join(pf, tpl)), Kind = "MinimalApi", Handler = handler, HandlerName = hname,
+                                    File = f, Line = cs.Line, OperationName = opName
+                                };
+                                ep.ExtraMarkers.AddRange(extra);
+                                if (handler == null) res.Warnings.Add(new Warn { Category = "Endpoint", Message = "No se pudo resolver el handler de " + v + " " + ep.Route, Loc = new Location(f, cs.Line) });
+                                eps.Add(ep);
+                            }
                 }
             }
             return eps;
+        }
+
+        static bool LooksLikeEndpointHandler(List<Token> t, int hs, int he)
+        {
+            // lambda con un unico parametro sin tipo (b => b.Run(...)) o que usa Run/Use: middleware
+            int k = hs;
+            if (IsI(t, k) && IsP(t, k + 1, "=>")) return false;
+            for (int q = hs; q < he; q++) if (IsI(t, q) && (t[q].Text == "Run" || t[q].Text == "Use" || t[q].Text == "UseMiddleware") && IsP(t, q - 1, ".")) return false;
+            return true;
+        }
+
+        // valores posibles de una plantilla: literal, constante, variable local o parametro (via sus llamadores)
+        List<string> TemplateValues(MethodDecl m, int s, int e, int depth)
+        {
+            var r = new List<string>();
+            var f = m.File; var t = f.Toks;
+            var ev = ix.EvalStringExpr(f, s, e, m.Owner, true, m, 0);
+            if (ev != null && ev.Complete) { r.Add(ev.Value); return r; }
+            if (e - s == 1 && IsI(t, s) && depth < 6)
+            {
+                int pi = m.Params.FindIndex(p => p.Name == t[s].Text);
+                if (pi >= 0)
+                {
+                    foreach (var kv in CallersOf(m))
+                    {
+                        var caller = kv.Key; var cs = kv.Value;
+                        int argPos = pi - (m.IsExtension && cs.Receiver.Count > 0 ? 1 : 0);
+                        if (cs.ArgOpen < 0) continue;
+                        var args = SplitArgs(caller.File, cs.ArgOpen);
+                        if (argPos < 0 || argPos >= args.Count) continue;
+                        r.AddRange(TemplateValues(caller, args[argPos][0], args[argPos][1], depth + 1));
+                    }
+                    if (r.Count > 0) return r.Distinct().ToList();
+                }
+            }
+            r.Add("{?}");
+            return r;
         }
 
         public List<int[]> SplitArgs(SourceFile f, int open)
@@ -345,27 +510,27 @@ namespace SPA_NS
             var attrs = new List<AttrInfo>();
             while (IsP(t, k, "[") && mt[k] > k && mt[k] < he) { ix.P(f).ParseAttrSection(k, mt[k], attrs); k = mt[k] + 1; }
             while (IsI(t, k) && (t[k].Text == "static" || t[k].Text == "async")) k++;
-            // lambda?
+            // lambda: buscar "=>" a profundidad 0 (admite tipo de retorno explicito: async Task<IResult> (...) =>)
             int arrow = -1;
             for (int q = k; q < he; q++)
             {
+                if ((IsP(t, q, "(") || IsP(t, q, "[") || IsP(t, q, "{")) && mt[q] > q) { q = mt[q]; continue; }
                 if (IsP(t, q, "=>")) { arrow = q; break; }
-                if ((IsP(t, q, "(") || IsP(t, q, "[") || IsP(t, q, "{")) && mt[q] > q) { if (q != k) break; q = mt[q]; continue; }
-                if (q > k + 1 && !IsP(t, q, "=>")) break;
             }
             if (arrow > 0)
             {
-                var md = new MethodDecl { Name = "lambda@" + t[hs].Line, Owner = m.Owner, File = f, Line = t[hs].Line, IsSynthetic = true, IsStatic = true, Attrs = attrs };
+                var md = new MethodDecl { Name = "lambda@" + t[hs].Line, Owner = m.Owner, File = f, Line = t[hs].Line, IsSynthetic = true, IsStatic = true, Attrs = attrs, Parent = m };
                 md.Id = "L" + (++lambdaSeq);
-                if (IsP(t, k, "(") && mt[k] > k) md.Params = ix.P(f).ParseParams(k, mt[k]);
-                else if (IsI(t, k)) md.Params.Add(new ParamInfo { Name = t[k].Text });
+                int pc = arrow - 1;
+                if (IsP(t, pc, ")") && mt[pc] >= k) md.Params = ix.P(f).ParseParams(mt[pc], pc);
+                else if (IsI(t, pc)) md.Params.Add(new ParamInfo { Name = t[pc].Text });
                 int b = arrow + 1;
                 if (IsP(t, b, "{") && mt[b] > b) { md.BodyStart = b + 1; md.BodyEnd = mt[b]; }
                 else { md.BodyStart = b; md.BodyEnd = he; }
                 md.DeclStartOffset = t[hs].Start; md.DeclEndOffset = t[he - 1].End;
                 return md;
             }
-            // grupo de metodos: Nombre | Tipo.Nombre
+            // grupo de metodos: Nombre | Tipo.Nombre | instancia.Nombre
             var names = new List<string>();
             int j = k;
             while (IsI(t, j)) { names.Add(t[j].Text); if (IsP(t, j + 1, ".") && IsI(t, j + 2)) j += 2; else { j++; break; } }
@@ -374,16 +539,16 @@ namespace SPA_NS
             var cands = new List<MethodDecl>();
             if (names.Count == 1)
             {
+                foreach (var lf in ix.LocalFunctionsInScope(m)) if (lf.Name == mname) cands.Add(lf);
                 var o = m.Owner;
                 while (o != null && cands.Count == 0) { cands.AddRange(ix.MethodsNamed(o.MergedInto ?? o, mname, true)); o = o.Outer; }
                 if (cands.Count == 0) { List<MethodDecl> l; if (ix.MethodsByName.TryGetValue(mname, out l) && l.Select(x => x.Owner).Distinct().Count() == 1) cands.AddRange(l); }
             }
             else
             {
-                foreach (var td in ix.ResolveTypeName(names[names.Count - 2], m.Owner)) cands.AddRange(ix.MethodsNamed(td, mname, true));
+                foreach (var td in ix.ResolveQualified(names.Take(names.Count - 1).ToList(), m.Owner)) cands.AddRange(ix.MethodsNamed(td, mname, true));
                 if (cands.Count == 0)
                 {
-                    // instancia: handler.Metodo
                     var cs = new CallSite { Name = mname, Receiver = names.Take(names.Count - 1).Select(x => new Seg { Name = x }).ToList(), Argc = -1, IsMethodGroup = true };
                     bool inf, unr; cands.AddRange(ix.ResolveCall(m, cs, out inf, out unr));
                 }
@@ -412,92 +577,186 @@ namespace SPA_NS
             return r;
         }
 
-        // prefijos de MapGroup para el receptor de una llamada Map*
-        List<string> ReceiverPrefixes(MethodDecl m, List<Seg> segs, int depth)
+        // prefijos de MapGroup para el receptor de una llamada Map*. ovr: prefijos fijados para parametros (al evaluar un metodo fabrica)
+        List<string> ReceiverPrefixes(MethodDecl m, List<Seg> segs, int depth, Dictionary<string, string> ovr)
         {
             var r = new List<string>();
             if (segs == null || segs.Count == 0 || depth > 48) { r.Add(""); return r; }
             List<string> roots;
             var s0 = segs[0];
+            int startIdx = 0;
             if (s0.IsCall && s0.Name == "MapGroup") roots = new List<string> { "" };
-            else if (s0.IsCall) roots = new List<string> { "" };
-            else roots = NamePrefixes(m, s0.Name, depth + 1);
+            else if (s0.IsCall)
+            {
+                // grupo devuelto por un metodo del repo: CreateApiGroup(app)
+                roots = ReturnPrefixesOfCall(m, s0, null, depth + 1);
+                startIdx = 1;
+            }
+            else
+            {
+                roots = NamePrefixes(m, s0.Name, depth + 1, ovr);
+                startIdx = 1;
+            }
             foreach (var root in roots)
             {
-                string pf = root;
-                for (int i = 0; i < segs.Count; i++)
+                var cur = new List<string> { root };
+                for (int i = startIdx; i < segs.Count; i++)
                 {
                     var s = segs[i];
-                    if (s.IsCall && s.Name == "MapGroup" && s.ArgOpen >= 0)
+                    if (!s.IsCall) continue;
+                    if (s.Name == "MapGroup" && s.ArgOpen >= 0)
                     {
                         var args = SplitArgs(m.File, s.ArgOpen);
                         if (args.Count > 0)
                         {
-                            var ev = ix.EvalStringExpr(m.File, args[0][0], args[0][1], m.Owner, true);
-                            pf = Join(pf, ev != null ? ev.Value : "{?}");
+                            var vals = TemplateValues(m, args[0][0], args[0][1], 0);
+                            cur = cur.SelectMany(c => vals.Select(v => Join(c, v))).ToList();
                         }
+                        continue;
                     }
+                    // metodo de extension del repo que devuelve un grupo: app.MapApiV1()
+                    var next = new List<string>();
+                    bool resolved = false;
+                    foreach (var c in cur)
+                    {
+                        var rp = ReturnPrefixesOfCall(m, s, c, depth + 1);
+                        if (rp != null) { resolved = true; next.AddRange(rp); }
+                    }
+                    if (resolved) cur = next;
                 }
-                r.Add(pf);
+                r.AddRange(cur);
             }
             return r;
         }
 
-        List<string> NamePrefixes(MethodDecl m, string name, int depth)
+        // prefijos que devuelve un metodo del repo (fabrica de grupos). thisPrefix: prefijo del receptor (metodos de extension)
+        List<string> ReturnPrefixesOfCall(MethodDecl m, Seg s, string thisPrefix, int depth)
+        {
+            if (depth > 40) return null;
+            var targets = new List<MethodDecl>();
+            foreach (var lf in ix.LocalFunctionsInScope(m)) if (lf.Name == s.Name) targets.Add(lf);
+            if (targets.Count == 0)
+            {
+                List<MethodDecl> l;
+                if (ix.MethodsByName.TryGetValue(s.Name, out l))
+                    targets.AddRange(l.Where(x => x.HasBody && x.ReturnType != null && RouteBuilderTypes.Contains(U.UnwrapRef(x.ReturnType).Name)));
+            }
+            if (targets.Count == 0) return null;
+            var r = new List<string>();
+            foreach (var tg in targets)
+            {
+                var ovr = new Dictionary<string, string>();
+                if (thisPrefix != null && tg.IsExtension && tg.Params.Count > 0) ovr[tg.Params[0].Name] = thisPrefix;
+                else if (s.ArgOpen >= 0)
+                {
+                    // argumentos que son grupos: CreateApiGroup(app.MapGroup("/x"))
+                    var args = SplitArgs(m.File, s.ArgOpen);
+                    int off = tg.IsExtension && thisPrefix != null ? 1 : 0;
+                    for (int i = 0; i < args.Count && i + off < tg.Params.Count; i++)
+                    {
+                        var segs = ix.ParseChainForward(m.File, args[i][0]);
+                        if (segs.Count > 0) ovr[tg.Params[i + off].Name] = ReceiverPrefixes(m, segs, depth + 1, null).FirstOrDefault() ?? "";
+                    }
+                }
+                var t = tg.File.Toks;
+                // expresion de retorno: cuerpo "=>" o sentencias "return"
+                var starts = new List<int>();
+                if (tg.BodyStart > 0 && IsP(t, tg.BodyStart - 1, "=>")) starts.Add(tg.BodyStart);
+                for (int k = tg.BodyStart; k < tg.BodyEnd && k < t.Count; k++) if (IsI(t, k) && t[k].Text == "return") starts.Add(k + 1);
+                foreach (var st in starts)
+                {
+                    var segs = ix.ParseChainForward(tg.File, st);
+                    if (segs.Count == 0) continue;
+                    r.AddRange(ReceiverPrefixes(tg, segs, depth + 1, ovr));
+                }
+            }
+            return r.Count > 0 ? r.Distinct().ToList() : null;
+        }
+
+        List<string> NamePrefixes(MethodDecl m, string name, int depth, Dictionary<string, string> ovr)
         {
             var r = new List<string>();
+            if (ovr != null && ovr.ContainsKey(name)) { r.Add(ovr[name]); return r; }
             LocalInfo li;
             if (m.HasBody && ix.Locals(m).TryGetValue(name, out li) && li.ExprTok >= 0)
             {
+                var t = m.File.Toks;
                 var segs = ix.ParseChainForward(m.File, li.ExprTok);
                 if (segs.Count > 0 && segs[0].Name == name) { r.Add(""); return r; }
-                return ReceiverPrefixes(m, segs, depth + 1);
+                return ReceiverPrefixes(m, segs, depth + 1, ovr);
             }
             int pi = m.Params.FindIndex(p => p.Name == name);
             if (pi >= 0)
             {
                 var prefixes = CallerPrefixes(m, pi, depth + 1);
                 // Carter: CarterModule("/prefijo")
-                if (m.Owner != null && ix.DerivesFrom(m.Owner, "CarterModule") && m.Owner.BaseCtorStrings.Count > 0)
-                    prefixes = prefixes.Select(x => Join(x, m.Owner.BaseCtorStrings[0])).ToList();
+                string carter = CarterPrefix(m.Owner);
+                if (carter != null) prefixes = prefixes.Select(x => Join(x, carter)).ToList();
                 return prefixes;
             }
-            if (m.Owner != null && ix.DerivesFrom(m.Owner, "CarterModule") && m.Owner.BaseCtorStrings.Count > 0) { r.Add(m.Owner.BaseCtorStrings[0]); return r; }
+            if (m.Parent != null) return NamePrefixes(m.Parent, name, depth + 1, ovr);
+            string cp = CarterPrefix(m.Owner);
+            if (cp != null) { r.Add(cp); return r; }
             r.Add("");
             return r;
         }
 
-        List<string> CallerPrefixes(MethodDecl target, int paramIndex, int depth)
+        string CarterPrefix(TypeDecl td)
         {
-            var r = new List<string>();
+            if (td == null || !ix.DerivesFrom(td, "CarterModule")) return null;
+            foreach (var ar in td.BaseCtorArgs) { var v = ArgString(ar, td); if (v != null) return v; }
+            if (td.BaseCtorStrings.Count > 0) return td.BaseCtorStrings[0];
+            return null;
+        }
+
+        List<KeyValuePair<MethodDecl, CallSite>> CallersOf(MethodDecl target)
+        {
             if (callersByName == null)
             {
                 callersByName = new Dictionary<string, List<KeyValuePair<MethodDecl, CallSite>>>();
                 foreach (var m in ix.Methods)
                     foreach (var cs in ix.Calls(m))
                     {
-                        if (cs.IsNew) continue;
+                        if (cs.IsNew || cs.IsMethodGroup) continue;
                         List<KeyValuePair<MethodDecl, CallSite>> l;
                         if (!callersByName.TryGetValue(cs.Name, out l)) { l = new List<KeyValuePair<MethodDecl, CallSite>>(); callersByName[cs.Name] = l; }
                         l.Add(new KeyValuePair<MethodDecl, CallSite>(m, cs));
                     }
             }
+            var r = new List<KeyValuePair<MethodDecl, CallSite>>();
             List<KeyValuePair<MethodDecl, CallSite>> callers;
-            if (target.IsSynthetic || !callersByName.TryGetValue(target.Name, out callers)) { r.Add(""); return r; }
-            bool ext = target.IsExtension;
+            if (target.IsSynthetic || !callersByName.TryGetValue(target.Name, out callers)) return r;
+            // otros metodos con el mismo nombre que reciben grupos: solo se aceptan llamadas sin resolver si el nombre es unico
+            List<MethodDecl> same;
+            int sameCount = ix.MethodsByName.TryGetValue(target.Name, out same) ? same.Count(x => x.Params.Any(p => p.Type != null && RouteBuilderTypes.Contains(p.Type.Name))) : 1;
             foreach (var kv in callers)
             {
                 var caller = kv.Key; var cs = kv.Value;
                 if (caller == target) continue;
-                if (cs.IsMethodGroup) continue;
-                bool fits = true;
-                int argc = cs.Argc;
-                int expected = target.Params.Count - (ext && cs.Receiver.Count > 0 ? 1 : 0);
-                if (argc >= 0 && argc > expected && !target.Params.Any(p => p.IsParams)) fits = false;
-                if (!fits) continue;
+                if (target.IsLocalFunction && !ix.LocalFunctionsInScope(caller).Contains(target) && caller != target.Parent) continue;
+                bool inf, unr;
+                var tg = ix.ResolveCall(caller, cs, out inf, out unr);
+                if (tg.Contains(target)) { r.Add(kv); continue; }
+                if (tg.Count == 0 && sameCount <= 1 && !target.IsLocalFunction)
+                {
+                    int expected = target.Params.Count - (target.IsExtension && cs.Receiver.Count > 0 ? 1 : 0);
+                    if (cs.Argc >= 0 && cs.Argc > expected && !target.Params.Any(p => p.IsParams)) continue;
+                    r.Add(kv);
+                }
+            }
+            return r;
+        }
+
+        List<string> CallerPrefixes(MethodDecl target, int paramIndex, int depth)
+        {
+            var r = new List<string>();
+            bool ext = target.IsExtension;
+            foreach (var kv in CallersOf(target))
+            {
+                var caller = kv.Key; var cs = kv.Value;
                 if (ext && paramIndex == 0 && cs.Receiver.Count > 0)
                 {
-                    r.AddRange(ReceiverPrefixes(caller, cs.Receiver, depth + 1));
+                    r.AddRange(ReceiverPrefixes(caller, cs.Receiver, depth + 1, null));
                     continue;
                 }
                 int argPos = paramIndex - (ext && cs.Receiver.Count > 0 ? 1 : 0);
@@ -505,13 +764,34 @@ namespace SPA_NS
                 var args = SplitArgs(caller.File, cs.ArgOpen);
                 if (argPos < 0 || argPos >= args.Count) continue;
                 var segs = ix.ParseChainForward(caller.File, args[argPos][0]);
-                r.AddRange(ReceiverPrefixes(caller, segs, depth + 1));
+                r.AddRange(ReceiverPrefixes(caller, segs, depth + 1, null));
             }
             if (r.Count == 0) r.Add("");
             return r.Distinct().ToList();
         }
 
         // ------------------------------------------------------------ FastEndpoints
+        void FindFastEndpointsPrefix()
+        {
+            foreach (var m in ix.Methods)
+            {
+                if (!m.HasBody) continue;
+                var t = m.File.Toks;
+                bool fe = false;
+                for (int k = m.BodyStart; k < m.BodyEnd && k < t.Count; k++) if (IsI(t, k) && t[k].Text == "UseFastEndpoints") { fe = true; break; }
+                if (!fe) continue;
+                for (int k = m.BodyStart; k < m.BodyEnd && k < t.Count; k++)
+                {
+                    if (IsI(t, k) && t[k].Text == "RoutePrefix" && IsP(t, k + 1, "="))
+                    {
+                        int e = ix.P(m.File).FindStmtEnd(k + 2, m.BodyEnd);
+                        var ev = ix.EvalStringExpr(m.File, k + 2, e, m.Owner, true, m, 0);
+                        if (ev != null && ev.Complete) fastEndpointsPrefix = ev.Value;
+                    }
+                }
+            }
+        }
+
         List<Endpoint> FastEndpoints()
         {
             var eps = new List<Endpoint>();
@@ -534,8 +814,11 @@ namespace SPA_NS
                     if (Regex.IsMatch(cs.Name, "^(Get|Post|Put|Delete|Patch)$")) { verbs.Add(cs.Name.ToUpperInvariant()); routes.AddRange(strs); }
                     else if (cs.Name == "Routes") routes.AddRange(strs);
                     else if (cs.Name == "Verbs")
+                    {
+                        foreach (var s in strs) verbs.Add(s.ToUpperInvariant());
                         for (int q = cs.ArgOpen; q < conf.File.Match[cs.ArgOpen]; q++)
-                            if (IsI(t, q) && Regex.IsMatch(t[q].Text, "^(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|Patch)$")) verbs.Add(t[q].Text.ToUpperInvariant());
+                            if (IsI(t, q) && Regex.IsMatch(t[q].Text, "^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Get|Post|Put|Delete|Patch|Head|Options)$")) verbs.Add(t[q].Text.ToUpperInvariant());
+                    }
                 }
                 if (routes.Count == 0) continue;
                 if (verbs.Count == 0) verbs.Add("ANY");
@@ -543,7 +826,8 @@ namespace SPA_NS
                 foreach (var c in td.Leading) foreach (var h in sm.FindInText(c.Text)) extra.Add(fx.NewMarker(h.Sp, new Location(td.File, c.Line), "endpoint-comment", c.Text));
                 foreach (var v in verbs.Distinct()) foreach (var rt in routes.Distinct())
                     {
-                        var ep = new Endpoint { Verb = v, Route = Normalize(rt), Kind = "FastEndpoints", Handler = handler, HandlerName = td.Name + "." + (handler != null ? handler.Name : "?"), File = td.File, Line = td.Line };
+                        string route = fastEndpointsPrefix != null ? Join(fastEndpointsPrefix, rt) : rt;
+                        var ep = new Endpoint { Verb = v, Route = Normalize(route), Kind = "FastEndpoints", Handler = handler, HandlerName = td.Name + "." + (handler != null ? handler.Name : "?"), File = td.File, Line = td.Line, ViaType = td };
                         ep.ExtraMarkers.AddRange(extra);
                         eps.Add(ep);
                     }
@@ -557,23 +841,26 @@ namespace SPA_NS
             var eps = new List<Endpoint>();
             foreach (var md in ix.Methods)
             {
-                if (!md.HasBody) continue;
+                if (!md.HasBody || md.IsSynthetic || md.IsLocalFunction) continue;
                 foreach (var p in md.Params)
                 {
                     var trig = p.Attrs.FirstOrDefault(a => a.Name == "HttpTrigger");
                     if (trig == null) continue;
                     var verbs = new List<string>();
-                    for (int i = 0; i < trig.Positional.Count; i++) if (trig.PositionalIsString[i]) verbs.Add(trig.Positional[i].ToUpperInvariant());
+                    for (int i = 0; i < trig.Positional.Count; i++)
+                    {
+                        string v = trig.PositionalIsString[i] ? trig.Positional[i] : (i < trig.PosArgs.Count ? ArgString(trig.PosArgs[i], md.Owner) : null);
+                        if (v != null && Regex.IsMatch(v, "^[A-Za-z]+$")) verbs.Add(v.ToUpperInvariant());
+                    }
                     if (verbs.Count == 0) verbs.Add("ANY");
-                    string route; trig.Named.TryGetValue("Route", out route);
-                    route = route != null ? route.Trim('"') : null;
+                    string route = NamedString(trig, "Route", md.Owner);
                     if (route == null)
                     {
                         var fa = md.Attrs.FirstOrDefault(a => a.Name == "Function" || a.Name == "FunctionName");
-                        route = fa != null && FirstString(fa) != null ? FirstString(fa) : md.Name;
+                        route = fa != null && FirstString(fa, md.Owner) != null ? FirstString(fa, md.Owner) : md.Name;
                     }
                     foreach (var v in verbs)
-                        eps.Add(new Endpoint { Verb = v, Route = Normalize(Join("api", route)), Kind = "AzureFunction", Handler = md, HandlerName = md.DisplayName, File = md.File, Line = md.Line });
+                        eps.Add(new Endpoint { Verb = v, Route = Normalize(Join("api", route)), Kind = "AzureFunction", Handler = md, HandlerName = md.DisplayName, File = md.File, Line = md.Line, ViaType = md.Owner });
                 }
             }
             return eps;

@@ -112,8 +112,17 @@ namespace SPA_NS
         }
     }
 
+    public class ArgRef
+    {
+        public SourceFile File;
+        public int S, E;   // rango de tokens [S, E)
+    }
+
     public class AttrInfo
     {
+        public SourceFile File;
+        public List<ArgRef> PosArgs = new List<ArgRef>();
+        public Dictionary<string, ArgRef> NamedArgs = new Dictionary<string, ArgRef>(StringComparer.OrdinalIgnoreCase);
         public string Name;
         public List<string> Positional = new List<string>();   // valor string si es literal, si no el texto crudo
         public List<bool> PositionalIsString = new List<bool>();
@@ -152,7 +161,9 @@ namespace SPA_NS
         public int Line;
         public List<TypeRef> Bases = new List<TypeRef>();
         public List<AttrInfo> Attrs = new List<AttrInfo>();
-        public bool IsAbstract, IsStatic, IsPartial;
+        public bool IsAbstract, IsStatic, IsPartial, IsPublic;
+        public List<string> TypeParams = new List<string>();
+        public List<ArgRef> BaseCtorArgs = new List<ArgRef>();
         public TypeDecl Outer;
         public List<MethodDecl> Methods = new List<MethodDecl>();
         public Dictionary<string, MemberVar> Members = new Dictionary<string, MemberVar>(StringComparer.Ordinal);
@@ -178,7 +189,10 @@ namespace SPA_NS
         public List<ParamInfo> Params = new List<ParamInfo>();
         public TypeRef ReturnType;
         public List<AttrInfo> Attrs = new List<AttrInfo>();
-        public bool IsStatic, IsPublic, IsAbstract, IsVirtual, IsOverride, IsCtor, IsExtension, IsSynthetic;
+        public bool IsStatic, IsPublic, IsAbstract, IsVirtual, IsOverride, IsCtor, IsExtension, IsSynthetic, IsLocalFunction;
+        public List<string> TypeParams = new List<string>();
+        public MethodDecl Parent;                                   // metodo contenedor (funciones locales y lambdas)
+        public List<MethodDecl> LocalFunctions = new List<MethodDecl>();
         public int BodyStart = -1, BodyEnd = -1;   // tokens [BodyStart, BodyEnd)
         public List<TokRange> Excluded = new List<TokRange>();
         public List<Comment> Leading = new List<Comment>();
@@ -232,6 +246,7 @@ namespace SPA_NS
         public List<Marker> Markers = new List<Marker>();
         public int Start, End, Line, EndLine;
         public bool Scoped;
+        public int ScopeOpen = -1, ScopeClose = -1;   // bloque { } que contiene al comentario
         public string Id;
     }
 
@@ -275,6 +290,9 @@ namespace SPA_NS
         public string Kind;              // bare / pure / regular / other / empty
         public bool HasDynamicSp;
         public string Form;              // forma de invocacion (para llamadas directas)
+        public bool Ignored;             // el string no es un comando (comparacion, valor de parametro, respuesta HTTP)
+        public string GroupVar;          // StringBuilder o variable acumulada a la que pertenece la pieza
+        public bool GroupAppendLine;
 
         public Location LocOfValueOffset(int off)
         {
@@ -303,6 +321,7 @@ namespace SPA_NS
         public List<Marker> ExtraMarkers = new List<Marker>();
         public string Note;
         public string Display { get { return Verb + " " + Route; } }
+        public TypeDecl ViaType;   // tipo concreto del handler (controller derivado que hereda la accion)
         public string Id;
     }
 
@@ -414,7 +433,7 @@ namespace SPA_NS
         public static TypeRef UnwrapRef(TypeRef t)
         {
             if (t == null) return null;
-            if ((t.Name == "Task" || t.Name == "ValueTask" || t.Name == "Nullable" || t.Name == "Lazy") && t.Args.Count == 1) return UnwrapRef(t.Args[0]);
+            if ((t.Name == "Task" || t.Name == "ValueTask" || t.Name == "Nullable" || t.Name == "Lazy" || t.Name == "IOptions" || t.Name == "IOptionsMonitor" || t.Name == "IOptionsSnapshot" || t.Name == "ActionResult") && t.Args.Count == 1) return UnwrapRef(t.Args[0]);
             return t;
         }
     }

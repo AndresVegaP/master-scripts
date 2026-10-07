@@ -216,7 +216,8 @@ namespace SPA_NS
             var td = new TypeDecl
             {
                 Name = t[k].Text, Kind = kind, Namespace = ns, Outer = outer, File = f, Line = t[k].Line,
-                Attrs = new List<AttrInfo>(attrs), IsAbstract = mods.Contains("abstract"), IsStatic = mods.Contains("static"), IsPartial = mods.Contains("partial")
+                Attrs = new List<AttrInfo>(attrs), IsAbstract = mods.Contains("abstract"), IsStatic = mods.Contains("static"), IsPartial = mods.Contains("partial"),
+                IsPublic = mods.Contains("public")
             };
             td.Id = "T" + (++seq);
             td.FullName = (outer != null ? outer.FullName + "." : (ns.Length > 0 ? ns + "." : "")) + td.Name;
@@ -224,7 +225,7 @@ namespace SPA_NS
             td.Usings = f.Usings;
             td.Files.Add(f);
             k++;
-            if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) k = g + 1; }
+            if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) { td.TypeParams = GenericParamNames(k, g); k = g + 1; } }
             if (IsP(k, "(") && M(k) > k) { int c = M(k); td.PrimaryCtor = ParseParams(k, c); k = c + 1; }
             if (IsP(k, ":"))
             {
@@ -240,6 +241,7 @@ namespace SPA_NS
                     {
                         int c = M(k);
                         for (int j = k + 1; j < c; j++) if (t[j].Kind == TokKind.Str) td.BaseCtorStrings.Add(t[j].Lit.PlainValue());
+                        AddArgRanges(k, td.BaseCtorArgs);
                         k = c + 1;
                     }
                     if (IsP(k, ",")) { k++; continue; }
@@ -280,7 +282,11 @@ namespace SPA_NS
                     k++;
                     if (IsIdent(k) && IsP(k + 1, "(") && M(k + 1) > 0)
                     {
-                        if (t[k].Text == "base") for (int q = k + 2; q < M(k + 1); q++) if (t[q].Kind == TokKind.Str) td.BaseCtorStrings.Add(t[q].Lit.PlainValue());
+                        if (t[k].Text == "base")
+                        {
+                            for (int q = k + 2; q < M(k + 1); q++) if (t[q].Kind == TokKind.Str) td.BaseCtorStrings.Add(t[q].Lit.PlainValue());
+                            AddArgRanges(k + 1, td.BaseCtorArgs);
+                        }
                         k = M(k + 1) + 1;
                     }
                 }
@@ -312,13 +318,15 @@ namespace SPA_NS
                 if (IsP(k, ".") && IsIdent(k + 1)) { name = t[k + 1].Text; nameTok = k + 1; k += 2; continue; }
                 break;
             }
-            if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) k = g + 1; }
+            List<string> mtp = null;
+            if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) { mtp = GenericParamNames(k, g); k = g + 1; } }
             if (IsP(k, "("))
             {
                 int c = M(k);
                 if (c < 0) return SkipUnknown(i, e);
                 var md = NewMethod(name, td, nameTok, declStart, attrs, mods);
                 md.ReturnType = type;
+                if (mtp != null) md.TypeParams = mtp;
                 md.Params = ParseParams(k, c);
                 md.IsExtension = md.Params.Count > 0 && md.Params[0].IsThis;
                 k = c + 1;
@@ -326,6 +334,8 @@ namespace SPA_NS
                 {
                     if (IsP(k, "(") && M(k) > k) k = M(k) + 1; else k++;
                 }
+                // comentarios entre la firma y el cuerpo: "public X Foo() // Migrado de ..."
+                if (k < t.Count) foreach (var cm in f.CommentsBetween(t[c].End, t[k].Start)) if (!cm.IsPreproc) md.Leading.Add(cm);
                 ParseBody(ref k, md);
                 if (td.Kind == "interface" && md.BodyStart < 0) md.IsAbstract = true;
                 Register(md, td);
@@ -639,7 +649,7 @@ namespace SPA_NS
             while (k < close && guard++ < 50)
             {
                 if (!IsIdent(k)) { k++; continue; }
-                var a = new AttrInfo { Line = t[k].Line, StartOffset = t[k].Start };
+                var a = new AttrInfo { Line = t[k].Line, StartOffset = t[k].Start, File = f };
                 string name = t[k].Text; k++;
                 while ((IsP(k, ".") || IsP(k, "::")) && IsIdent(k + 1)) { name = t[k + 1].Text; k += 2; }
                 if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) k = g + 1; }
@@ -670,14 +680,47 @@ namespace SPA_NS
                             val = sb.ToString();
                         }
                         for (int q = vs; q < ae; q++) if (t[q].Kind == TokKind.Str) a.AllStrings.Add(t[q].Lit.PlainValue());
-                        if (key != null) a.Named[key] = val;
-                        else { a.Positional.Add(val); a.PositionalIsString.Add(isStr); }
+                        var ar = new ArgRef { File = f, S = vs, E = ae };
+                        if (key != null) { a.Named[key] = val; a.NamedArgs[key] = ar; }
+                        else { a.Positional.Add(val); a.PositionalIsString.Add(isStr); a.PosArgs.Add(ar); }
                         as0 = ae + 1;
                     }
                     k = c + 1;
                 }
                 list.Add(a);
                 if (IsP(k, ",")) k++;
+            }
+        }
+
+        // nombres de los parametros genericos de "<T, in U, [Attr] V>"
+        List<string> GenericParamNames(int open, int close)
+        {
+            var r = new List<string>();
+            int depth = 0;
+            for (int j = open + 1; j < close; j++)
+            {
+                if (IsP(j, "<")) { depth++; continue; }
+                if (IsP(j, ">")) { depth--; continue; }
+                if (IsP(j, "[") && M(j) > j) { j = M(j); continue; }
+                if (depth == 0 && IsIdent(j) && t[j].Text != "in" && t[j].Text != "out" && (IsP(j + 1, ",") || j + 1 == close)) r.Add(t[j].Text);
+            }
+            return r;
+        }
+
+        // rangos de los argumentos de una lista "( a, b, c )" que empieza en 'open'
+        void AddArgRanges(int open, List<ArgRef> into)
+        {
+            int c = M(open);
+            if (c < 0) return;
+            int s = open + 1;
+            for (int j = open + 1; j <= c; j++)
+            {
+                if (j < c && (IsP(j, "(") || IsP(j, "[") || IsP(j, "{")) && M(j) > j) { j = M(j); continue; }
+                if (j == c || IsP(j, ","))
+                {
+                    if (j > s) into.Add(new ArgRef { File = f, S = s, E = j });
+                    s = j + 1;
+                }
             }
         }
 
