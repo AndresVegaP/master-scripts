@@ -132,9 +132,13 @@ Desde cada endpoint se siguen las llamadas a:
 - interfaces, hacia todas sus implementaciones, y clases base y overrides;
 - handlers MediatR/CQRS (`_mediator.Send(new XQuery())` llega a `XQueryHandler.Handle`), `Publish` hacia los notification handlers y `ICommandHandler<T>`;
 - métodos de extensión, clases estáticas (DAL) y métodos de un Unit of Work (`_uow.Ventas.Listar()`);
+- clases base: la llamada `base.Metodo()` y los métodos virtuales se resuelven sobre el tipo concreto (template methods);
+- `Lazy<T>.Value`, `IOptions<T>.Value`, casts `((IRepo)x).Metodo()`, diccionarios de estrategias (`_mapa[tipo].Ejecutar()`), fábricas `Func<T>` y `GetRequiredService<T>()`;
+- grupos de métodos pasados como delegados (`ids.Select(_repo.Obtener)`) y funciones locales;
 - constantes (`const string`, `static readonly`), también en clases de constantes como `StoredProcedures.ListarVentas`;
-- strings interpolados con constantes (`$"{Paquete}.SP_X"`);
-- archivos `.sql` cargados por nombre, recursos `.resx` y valores de `appsettings*.json`.
+- strings interpolados con constantes (`$"{Paquete}.SP_X"`), `string.Format`, `string.Concat` y `AppendFormat`;
+- queries armadas con `StringBuilder` o con `sql += ...`: las piezas se unen en una sola query, incluidos los comentarios SQL que vayan en su propia pieza;
+- archivos `.sql` cargados por nombre, recursos `.resx` (también su `<comment>`) y valores de `appsettings*.json`, ya sea con `IConfiguration["Seccion:Clave"]`, `GetSection(...)[...]` o clases de opciones `IOptions<T>` (la sección se toma de `Configure<T>(GetSection("..."))`).
 
 ### 6.3 Nombres de SP
 
@@ -144,7 +148,9 @@ Desde cada endpoint se siguen las llamadas a:
 | `SP_X` / `FN_X` / `PRC_X` sin package | Dentro de SQL solo cuentan si se invocan: van seguidos de `(` o `;`, o después de `CALL`/`EXEC`. Así una columna llamada `SP_FLAG` no se confunde con un SP. |
 | Dentro de un literal SQL `'...'` o `q'[...]'` | Se ignora: es un dato, no una llamada. |
 | Dentro de un comentario SQL (`--` o `/* */`) | Es un **marcador**: documenta qué SP se migró. |
-| En `logger.LogError(...)`, `throw new Exception(...)` o `Console.WriteLine` | No es una llamada. Solo sirve como pista débil. |
+| En `logger.LogError(...)`, `throw new Exception(...)` o `Console.WriteLine` | No es una llamada. Solo sirve como pista débil: se usa únicamente si el método no tiene otro comentario de SP. |
+| En comparaciones (`if (x == "PCK_...")`), valores de parámetros (`new { p = "PCK_..." }`, `parametros.Add(...)`) o respuestas HTTP (`Ok("...")`, `BadRequest("...")`) | Se ignora: no es un comando. |
+| `PCK_X.SEQ.NEXTVAL`, `%TYPE`, `%ROWTYPE` | Se ignora: son secuencias o tipos, no SP. |
 
 ### 6.4 Asociación entre un SP migrado y su query (convención de comentarios)
 
@@ -152,9 +158,9 @@ El script busca el comentario que nombra al SP migrado empezando por el más cer
 
 1. Comentario SQL **dentro de la query**: `-- Migrado de PCK_VENTAS.SP_LISTAR_VENTAS`.
 2. Comentario **sobre la constante** que tiene la query.
-3. Comentario **previo dentro del mismo método**. Vale hasta el siguiente comentario que nombre otro SP; también cuenta un comentario al final de la misma línea.
-4. XML doc (`/// <summary>`), comentarios o atributos (p. ej. `[SwaggerOperation(Description = "SP: ...")]`) **del método**.
-5. Comentario del **método llamador** más cercano, por ejemplo la acción del controller (&dagger;).
+3. Comentario **previo dentro del mismo método**. Vale hasta el siguiente comentario que nombre otro SP y solo dentro de su bloque `{ }`: un comentario en la rama `if` no se aplica a la rama `else`. También cuenta un comentario al final de la misma línea.
+4. XML doc (`/// <summary>`), comentarios (también al final de la línea de la firma) o atributos (p. ej. `[SwaggerOperation(Description = "SP: ...")]`) **del método**. Las menciones en mensajes de log solo se usan si no hay ninguno de los anteriores.
+5. Documentación del **método de la interfaz** por la que se llamó, o comentario del **método llamador** más cercano, por ejemplo la acción del controller (&dagger;).
 6. Comentario de la **clase**, solo si nombra exactamente un SP.
 
 Si el comentario nombra un SP que la propia query **llama**, solo documenta esa llamada: no la convierte en migración.
@@ -183,7 +189,9 @@ const string SqlListarVentas = @"
 
 | Situación | Qué hace el script |
 |---|---|
-| El nombre del SP se arma en tiempo de ejecución (`"PCK_" + variable + ".SP_X"`) | No lo puede resolver. Lo deja como advertencia "SP dinámico", y si un comentario nombra el SP, aparece como "Solo en comentario". |
+| El nombre del SP se arma en tiempo de ejecución (`"PCK_" + variable + ".SP_X"`), o el texto del comando llega en una variable que no se puede evaluar | No lo puede resolver. Lo deja como advertencia "SP dinámico" o "Comando no resuelto", y si un comentario nombra el SP, aparece como "Solo en comentario". |
+| Una clase de opciones (`IOptions<T>`) cuya sección no se puede deducir y cuya clave aparece en varias secciones | Lo deja como advertencia "Configuración ambigua". |
+| Sobrecargas con la misma cantidad de parámetros | Se siguen todas. Es una aproximación conservadora: puede sumar un SP de más, pero no omite ninguno. |
 | Llamadas por reflexión, `dynamic` o delegados guardados en diccionarios | No se siguen. Si el método destino puede llegar a un SP, lo reporta como "Llamada no resuelta". |
 | Varias clases con el mismo nombre de método y receptor de tipo desconocido | Si hay 3 clases o menos, sigue todas las candidatas y marca la fila con &dagger;. Si hay más, lo reporta como advertencia con los posibles destinos. |
 | Sinónimos de Oracle o packages sin el prefijo `PCK_`/`PKG_` | Agrega el prefijo con `-PackagePrefixes`. Un nombre sin prefijo solo se detecta si se ejecuta con `CommandType.StoredProcedure`. |

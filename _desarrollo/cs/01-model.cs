@@ -382,6 +382,7 @@ namespace SPA_NS
         public Dictionary<string, List<string>> EndpointTraces = new Dictionary<string, List<string>>();
         public int FilesCs, FilesSql, Types, Methods;
         public List<string> ParseErrors = new List<string>();
+        public List<string> EncodingNotes = new List<string>();   // archivos leidos como Windows-1252
         public string ConventionalTemplate;
     }
 

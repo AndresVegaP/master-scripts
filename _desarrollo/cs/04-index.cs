@@ -983,8 +983,10 @@ namespace SPA_NS
                 bool afterDot = IsP(t, k - 1, ".") || IsP(t, k - 1, "?.");
                 if (IsP(t, a, "(") && mt[a] > a)
                 {
-                    // descartar declaraciones de funciones locales: "Tipo Nombre(" con tipo previo
+                    // descartar declaraciones de funciones locales: "Tipo Nombre(" con tipo previo, o seguidas de { / => / where
                     if (!afterDot && k > m.BodyStart && IsI(t, k - 1) && !U.IsKeyword(t[k - 1].Text) && IsDeclContext(t, k - 1)) continue;
+                    int after = mt[a] + 1;
+                    if (!afterDot && (IsP(t, after, "{") || IsP(t, after, "=>") || (IsI(t, after) && t[after].Text == "where"))) continue;
                     if (tk.Text == "this" || tk.Text == "base") continue;
                     var cs = new CallSite { Name = tk.Text, Tok = k, Line = tk.Line, ArgOpen = a, Argc = CountArgs(f, a) };
                     if (afterDot) { int st; cs.Receiver = WalkBack(f, k - 1, out st); }

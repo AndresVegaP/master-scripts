@@ -88,6 +88,27 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Con "powershell -File", una lista 'A','B' llega como un unico texto "A,B": se separa aqui.
+function Split-ListParam([string[]]$values) {
+    $r = New-Object System.Collections.Generic.List[string]
+    foreach ($v in @($values)) {
+        if ($null -eq $v) { continue }
+        foreach ($p in ($v -split ',')) {
+            $x = $p.Trim().Trim("'").Trim('"').Trim()
+            if ($x.Length -gt 0) { $r.Add($x) }
+        }
+    }
+    return [string[]]$r.ToArray()
+}
+$PackagePrefixes = Split-ListParam $PackagePrefixes
+$ObjectPrefixes = Split-ListParam $ObjectPrefixes
+$ExcludePath = Split-ListParam $ExcludePath
+foreach ($p in @($PackagePrefixes) + @($ObjectPrefixes)) {
+    if ($p -notmatch '^[A-Za-z][A-Za-z0-9_$#]*$') { throw "Prefijo no valido: '$p'. Use solo letras, numeros y '_' (por ejemplo PCK_ o SP_)." }
+}
+if (@($PackagePrefixes).Count -eq 0) { $PackagePrefixes = @('PCK_', 'PKG_') }
+if (@($ObjectPrefixes).Count -eq 0) { $ObjectPrefixes = @('SP_', 'FN_', 'PRC_') }
 $ScriptVersion = '1.0.0'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -117,13 +138,17 @@ Write-Host "  Repositorio : $RepoPath"
 Write-Host "  Salida      : $OutputPath"
 
 # ---------------------------------------------------------------- descubrimiento de archivos
-$excludedDirNames = @('bin', 'obj', '.git', '.vs', '.vscode', '.idea', 'node_modules', 'packages', 'TestResults', 'artifacts',
-    '.github', '.gitlab', '.azuredevops', 'docs', 'doc', 'documentation', 'documentacion', "documentaci$([char]0x00F3)n", '.claude', '.config')
+$excludedDirNames = @('bin', 'obj', '.git', '.vs', '.vscode', '.idea', 'node_modules', 'TestResults', '.github', '.gitlab', '.azuredevops', '.claude', '.config')
+# solo se excluyen si estan en la raiz del repo (en otro nivel pueden ser modulos de codigo)
+$excludedRootNames = @('packages', 'artifacts')
+# carpetas de documentacion: se ignoran .sql/.resx/.json (analisis, scripts de BD) pero se leen los .cs (pueden ser modulos "Docs")
+$docDirNames = @('docs', 'doc', 'documentation', 'documentacion', "documentaci$([char]0x00F3)n")
 
 function Test-Excluded([string]$relPath) {
     foreach ($p in $ExcludePath) {
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
-        $pp = $p.Replace('\', '/')
+        $pp = $p.Replace('\', '/').TrimEnd('/')
+        if ($pp.Length -eq 0) { continue }
         if ($relPath -like $pp -or $relPath -like "$pp/*" -or $relPath -like "*/$pp" -or $relPath -like "*/$pp/*") { return $true }
     }
     return $false
@@ -141,11 +166,13 @@ $configFiles = New-Object System.Collections.Generic.List[string]
 $csprojFiles = New-Object System.Collections.Generic.List[string]
 $skippedDirs = New-Object System.Collections.Generic.List[string]
 
-$stack = New-Object System.Collections.Generic.Stack[string]
+$stack = New-Object System.Collections.Generic.Stack[object]
 $visitedDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-$stack.Push($RepoPath)
+$stack.Push(@($RepoPath, $false))
 while ($stack.Count -gt 0) {
-    $dir = $stack.Pop()
+    $item = $stack.Pop()
+    $dir = [string]$item[0]
+    $inDocs = [bool]$item[1]
     # OneDrive marca las carpetas como reparse points: no se saltan, pero se evita recorrer dos veces
     # la misma carpeta y los ciclos de enlaces con un limite de profundidad
     if (-not $visitedDirs.Add($dir)) { continue }
@@ -154,8 +181,9 @@ while ($stack.Count -gt 0) {
         foreach ($d in [System.IO.Directory]::EnumerateDirectories($dir)) {
             $name = [System.IO.Path]::GetFileName($d)
             $rel = Get-RelPath $d
-            if ($excludedDirNames -contains $name -or (Test-Excluded $rel)) { $skippedDirs.Add($rel); continue }
-            $stack.Push($d)
+            $atRoot = -not $rel.Contains('/')
+            if ($excludedDirNames -contains $name -or ($atRoot -and $excludedRootNames -contains $name) -or (Test-Excluded $rel)) { $skippedDirs.Add($rel); continue }
+            $stack.Push(@($d, ($inDocs -or ($docDirNames -contains $name))))
         }
         foreach ($f in [System.IO.Directory]::EnumerateFiles($dir)) {
             $rel = Get-RelPath $f
@@ -167,9 +195,9 @@ while ($stack.Count -gt 0) {
                     if ($fn -match '(?i)\.(g|g\.i|designer|generated|AssemblyInfo|AssemblyAttributes)\.cs$' -or $fn -match '(?i)^(AssemblyInfo|GlobalUsings\.g)\.cs$') { continue }
                     $csFiles.Add($f)
                 }
-                '.sql' { $sqlFiles.Add($f) }
-                '.resx' { $resxFiles.Add($f) }
-                '.json' { if ($fn -like 'appsettings*.json') { $configFiles.Add($f) } }
+                '.sql' { if (-not $inDocs) { $sqlFiles.Add($f) } }
+                '.resx' { if (-not $inDocs) { $resxFiles.Add($f) } }
+                '.json' { if (-not $inDocs -and $fn -like 'appsettings*.json') { $configFiles.Add($f) } }
                 '.csproj' { $csprojFiles.Add($f) }
             }
         }

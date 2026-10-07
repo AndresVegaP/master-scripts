@@ -114,7 +114,13 @@ namespace SPA_NS
         }
 
         public static bool IsIdStart(char c) { return char.IsLetter(c) || c == '_'; }
-        public static bool IsIdPart(char c) { return char.IsLetterOrDigit(c) || c == '_'; }
+        public static bool IsIdPart(char c)
+        {
+            if (char.IsLetterOrDigit(c) || c == '_') return true;
+            var uc = char.GetUnicodeCategory(c);
+            return uc == System.Globalization.UnicodeCategory.NonSpacingMark || uc == System.Globalization.UnicodeCategory.SpacingCombiningMark
+                || uc == System.Globalization.UnicodeCategory.ConnectorPunctuation || uc == System.Globalization.UnicodeCategory.Format;
+        }
 
         // Devuelve null si no es un string. 'end' = indice despues del string.
         public static StrLit LexString(string s, int i, out int end)
@@ -266,6 +272,9 @@ namespace SPA_NS
                     var l = LexString(s, k, out e);
                     if (l != null && e > k) { k = e; continue; }
                 }
+                // comentarios dentro del hueco: un apostrofo en "/* don't */" no es un literal char
+                if (c == '/' && k + 1 < n && s[k + 1] == '/') { int e = s.IndexOf('\n', k); k = e < 0 ? n : e; continue; }
+                if (c == '/' && k + 1 < n && s[k + 1] == '*') { int e = s.IndexOf("*/", k + 2, StringComparison.Ordinal); k = e < 0 ? n : e + 2; continue; }
                 if (c == '\'')
                 {
                     int j = k + 1;

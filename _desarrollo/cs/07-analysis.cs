@@ -52,9 +52,31 @@ namespace SPA_NS
         SourceFile LoadText(string path)
         {
             var sf = new SourceFile { Path = path, Rel = Rel(path) };
-            sf.Text = File.ReadAllText(path);
+            string enc;
+            string text = ReadSource(path, out enc);
+            if (enc == "windows-1252") Res.EncodingNotes.Add(sf.Rel);
+            // CR suelto, NEL, LS y PS tambien terminan linea en C#: se normalizan a LF (CRLF -> LF conserva el numero de linea)
+            text = text.Replace("\r\n", "\n").Replace('\r', '\n').Replace((char)0x85, '\n').Replace((char)0x2028, '\n').Replace((char)0x2029, '\n');
+            sf.Text = text;
             sf.LineStarts = SourceFile.ComputeLineStarts(sf.Text);
             return sf;
+        }
+
+        // UTF-8/UTF-16/UTF-32 con BOM; sin BOM: UTF-8 estricto y, si no es valido, Windows-1252 (fuentes legacy en ANSI)
+        static string ReadSource(string path, out string encName)
+        {
+            var bytes = File.ReadAllBytes(path);
+            encName = "utf-8";
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return new UTF8Encoding(false).GetString(bytes, 3, bytes.Length - 3);
+            if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0 && bytes[3] == 0) { encName = "utf-32"; return new UTF32Encoding(false, true).GetString(bytes, 4, bytes.Length - 4); }
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) { encName = "utf-16"; return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2); }
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) { encName = "utf-16be"; return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2); }
+            try { return new UTF8Encoding(false, true).GetString(bytes); }
+            catch (DecoderFallbackException) { }
+            encName = "windows-1252";
+            Encoding ansi;
+            try { ansi = Encoding.GetEncoding(1252); } catch { ansi = Encoding.GetEncoding("iso-8859-1"); }
+            return ansi.GetString(bytes);
         }
 
         public void Execute()
