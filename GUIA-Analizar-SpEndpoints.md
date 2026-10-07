@@ -21,8 +21,8 @@ El resultado es un `.md` de lectura rápida. Opcionalmente también genera un `.
 
 ## 2. Instalación
 
-1. Descarga el repositorio como ZIP desde GitHub (*Code > Download ZIP*) y extráelo en una ruta corta, por ejemplo `C:\herramientas\`. Las rutas de los repos de prueba son profundas, y el Explorador de Windows no extrae rutas de más de 260 caracteres.
-2. Para usarlo basta con el archivo `Analizar-SpEndpoints.ps1`. Puedes copiarlo a cualquier carpeta, por ejemplo `repo/docs/local/scripts/`. Las carpetas `_desarrollo/` y los `.md` solo sirven para mantenerlo.
+1. Descarga el repositorio como ZIP desde GitHub (*Code > Download ZIP*) y extráelo, por ejemplo en `C:\herramientas\`. El ZIP trae solo el script, esta guía, el prompt de verificación y el README.
+2. Para usarlo basta con el archivo `Analizar-SpEndpoints.ps1`. Puedes copiarlo a cualquier carpeta, por ejemplo `repo/docs/local/scripts/`.
 3. Los archivos descargados de internet quedan marcados como bloqueados. Si tu equipo lo permite, desbloquéalos una vez:
 
 ```powershell
@@ -63,16 +63,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Analizar-SpEndpoints.ps1
 
 Si `-OutputPath` apunta a una carpeta, el reporte se crea dentro con el nombre `reporte-sp-endpoints.md`. El reporte siempre es `.md`: si indicas otra extensión (p. ej. `reporte.csv`), el script avisa y usa `reporte.md`. Con `-ExportCsv`, el `.csv` se crea al lado, con el mismo nombre.
 
-**Con `-File`** (por ejemplo, con `-ExecutionPolicy Bypass`), PowerShell recibe los parámetros de lista como texto. Escríbelos separados por coma: `-PackagePrefixes PCK_,PKG_,PK_` o `-ExcludePath "src/Legacy/*,*Migrations*"`.
+**Con `-File`** (por ejemplo, con `-ExecutionPolicy Bypass`), PowerShell recibe los parámetros de lista como texto. Escríbelos separados por coma y **sin espacios**: `-PackagePrefixes PCK_,PKG_,PK_` o `-ExcludePath "src/Legacy/*,*Migrations*"`. Los prefijos que se usaron quedan anotados al inicio del reporte ("Prefijos de package: ...").
 
 ## 4. Parámetros
 
 | Parámetro | Alias | Por defecto | Para qué sirve |
 |---|---|---|---|
-| `-RepoPath` | `-Repo`, `-Ruta` | Carpeta del script | Carpeta a analizar: la raíz del repo o una subcarpeta (p. ej. `repo\carpeta-api\src`). |
+| `-RepoPath` | `-Repo`, `-Ruta` | Carpeta del script | Carpeta a analizar: la raíz del repo o una subcarpeta (p. ej. `repo\carpeta-api\src`). Debe incluir **todos los proyectos que usa la API**. Si un `.csproj` referencia (`ProjectReference`) un proyecto que está fuera de esa carpeta, el script avisa en la consola y al inicio del reporte ("Análisis incompleto"), porque los SP de ese código no aparecerían. |
 | `-OutputPath` | `-Salida`, `-Output` | `<carpeta del script>\reporte-sp-endpoints.md` | Ruta del `.md`, o una carpeta donde crearlo. |
-| `-PackagePrefixes` | | `PCK_`, `PKG_` | Prefijos de los packages Oracle. |
-| `-ObjectPrefixes` | | `SP_`, `FN_`, `PRC_` | Prefijos de procedimientos y funciones sin package. |
+| `-PackagePrefixes` | | `PCK_`, `PKG_` | Prefijos de los packages Oracle. La lista **reemplaza** a los valores por defecto: incluye también los que se usen (p. ej. `PCK_,PKG_,PK_`). |
+| `-ObjectPrefixes` | | `SP_`, `FN_`, `PRC_` | Prefijos de procedimientos y funciones sin package. También reemplaza a los valores por defecto. |
 | `-ExcludePath` | | (vacío) | Patrones comodín, relativos al repo, para excluir más carpetas o archivos. Ejemplo: `-ExcludePath 'src/Legacy/*','*Migrations*'`. |
 | `-IncludeTests` | | Desactivado | Incluye los proyectos de test, que por defecto se excluyen para no contar SP de mocks. |
 | `-ExportCsv` | | Desactivado | Genera además un `.csv` (separado por `;`, UTF-8) con todas las filas, la forma de llamada y la traza de métodos. |
@@ -96,8 +96,8 @@ Ejemplo con prefijos propios:
 | **3. SP migrados con SP hijos** | Cada SP migrado junto con sus hijos y el estado de cada hijo: **pendiente**, o **ya migrado en el repo** (en ese caso se muestran también sus nietos). |
 | **4. SP llamados directamente** | SP que se ejecutan tal cual, con la forma de llamada (nombre + `CommandType.StoredProcedure`, `BEGIN ... END;`, `CALL`/`EXEC`, `SELECT ... FROM DUAL` o dentro de una query). |
 | **5. Inventario de pendientes** | Lista única de SP pendientes de migrar (llamados directamente + hijos no migrados), ordenada por la cantidad de endpoints que dependen de cada uno. Sirve para **priorizar**. |
-| **6. Endpoints sin SP** | Endpoints que no usan SP, con el motivo (p. ej. "ejecuta 3 consultas SQL sin SP asociado"). |
-| **7. Revisión manual** | SP mencionados solo en comentarios, advertencias y referencias a SP en código que ningún endpoint alcanza. Las advertencias son: "Llamada no resuelta", "SP dinámico", "Comando no resuelto", "Configuración ambigua", "Asociación ambigua" y "Profundidad máxima". |
+| **6. Endpoints sin SP** | Endpoints que no usan SP, con el motivo (p. ej. "Ejecuta 3 consulta(s) SQL sin SP asociado"). |
+| **7. Revisión manual** | 7.1: SP mencionados solo en comentarios. 7.2: advertencias ("Llamada no resuelta", "SP dinámico", "Comando no resuelto", "Configuración ambigua", "Asociación ambigua", "Profundidad máxima" y "Endpoint"; ver la sección 7 de esta guía). 7.3: referencias a SP en código que ningún endpoint alcanza. 7.4 (solo si hubo errores): archivos que no se pudieron leer; su contenido no se analizó. |
 | **8. Cruce con Swagger** | Solo aparece si usas `-SwaggerPath`. Muestra los endpoints documentados que no están en el código, y al revés. Como prefijo de las rutas usa `basePath` (Swagger 2) o la ruta de `servers[0].url` (OpenAPI 3). Si el archivo no se puede leer, el motivo queda escrito en esta sección. |
 | **Metodología** | Carpetas omitidas, archivos de test excluidos y archivos leídos como ANSI (ver 6.6). |
 
@@ -109,10 +109,24 @@ Ejemplo con prefijos propios:
 | **Llamado directamente (dentro de query)** | El SP o la función aparece dentro de un `SELECT`/`INSERT`/... que no tiene un comentario de SP migrado. |
 | **Migrado sin hijos (listo)** | Un comentario nombra el SP y la query que lo reemplaza no llama a ningún SP. |
 | **SP hijo (pendiente)** | La query que reemplazó al SP de la 2.ª columna todavía llama al SP de la 3.ª columna. |
-| **SP hijo (ya migrado en el repo)** | Igual que el anterior, pero ese hijo ya tiene su propia query migrada en otro lugar del repo. |
+| **SP hijo (ya migrado en el repo)** | Igual que el anterior, pero ese hijo ya tiene su propia query migrada en otro lugar del repo. Ojo: esta query todavía lo ejecuta en Oracle, así que no se puede retirar de la BD hasta que la query use la versión migrada. |
 | **SP hijo nivel N** | Nieto, bisnieto, etc. La 3.ª columna muestra la cadena: `HIJO → NIETO`. |
 | **Solo en comentario (revisar)** | Se menciona un SP en el flujo del endpoint, pero no hay código que lo respalde. |
-| **&dagger;** | La asociación es inferida: viene del comentario de un método llamador (p. ej. la acción del controller), o la llamada se resolvió solo por el nombre del método. Conviene verificarla. |
+| **&dagger;** | La asociación es inferida: viene del comentario de un método llamador (p. ej. la acción del controller) o del comentario de la clase, o la llamada se resolvió solo por el nombre del método. Conviene verificarla. |
+
+### Códigos en el CSV
+
+En el `.csv` (`-ExportCsv`), la columna *Tipo* usa códigos, y el estado y el nivel del hijo van en columnas aparte:
+
+| Código | Equivale a |
+|---|---|
+| `DIRECTO` | Llamado directamente. La columna *Forma* indica cómo se llama. |
+| `DIRECTO_EN_QUERY` | Llamado directamente (dentro de query). |
+| `MIGRADO_LISTO` | Migrado sin hijos (listo). |
+| `HIJO` | SP hijo. *Nivel* = 1 es un hijo y *Nivel* = 2 o más es un nieto, bisnieto, etc. *EstadoHijo* = `PENDIENTE` o `MIGRADO_EN_REPO` (ya migrado en el repo). En *SpHijo*, la cadena se separa con `->`. |
+| `SOLO_COMENTARIO` | Solo en comentario (revisar). |
+| *Inferido* = `True` | &dagger; |
+| *Traza* | Cadena de métodos desde el endpoint hasta el SP. |
 
 ## 6. Cómo identifica cada caso
 
@@ -167,7 +181,7 @@ El script busca el comentario que nombra al SP migrado empezando por el más cer
 3. Comentario **previo dentro del mismo método**. Vale hasta el siguiente comentario que nombre otro SP y solo dentro de su bloque `{ }`: un comentario en la rama `if` no se aplica a la rama `else`. También cuenta un comentario al final de la misma línea.
 4. XML doc (`/// <summary>`), comentarios (también al final de la línea de la firma) o atributos (p. ej. `[SwaggerOperation(Description = "SP: ...")]`) **del método**. Las menciones en mensajes de log solo se usan si no hay ninguno de los anteriores.
 5. Documentación del **método de la interfaz** por la que se llamó, o comentario del **método llamador** más cercano, por ejemplo la acción del controller (&dagger;).
-6. Comentario de la **clase**, solo si nombra exactamente un SP.
+6. Comentario de la **clase**, solo si nombra exactamente un SP (&dagger;).
 
 Si el comentario nombra un SP que la propia query **llama**, solo documenta esa llamada: no la convierte en migración.
 
@@ -204,14 +218,16 @@ const string SqlListarVentas = @"
 
 | Situación | Qué hace el script |
 |---|---|
-| El nombre del SP se arma en tiempo de ejecución (`"PCK_" + variable + ".SP_X"`), o el texto del comando llega en una variable que no se puede evaluar | No lo puede resolver. Lo deja como advertencia "SP dinámico" o "Comando no resuelto", y si un comentario nombra el SP, aparece como "Solo en comentario". |
+| El nombre del SP se arma en tiempo de ejecución (`"PCK_" + variable + ".SP_X"`), el texto del comando llega en una variable que no se puede evaluar, o el nombre del SP se pasa a un wrapper (`EjecutarSp(nombre, ...)`) con un valor que no se puede evaluar (por ejemplo, una opción de configuración que no está en el `appsettings` del repo) | No lo puede resolver. Lo deja como advertencia "SP dinámico" o "Comando no resuelto", y el endpoint aparece en "Endpoints sin SP" con el motivo "No se pudo determinar el SP: ver advertencias (sección 7.2)". La excepción es cuando un comentario nombra el SP: entonces el endpoint aparece en la tabla principal como "Solo en comentario" (7.1), cuenta en "Endpoints con SP asociado" y no sale en la sección 6. |
 | Una clase de opciones (`IOptions<T>`) cuya sección no se puede deducir y cuya clave aparece en varias secciones | Lo deja como advertencia "Configuración ambigua". |
 | Sobrecargas con la misma cantidad de parámetros | Se siguen todas. Es una aproximación conservadora: puede sumar un SP de más, pero no omite ninguno. |
-| Llamadas por reflexión, `dynamic` o delegados guardados en diccionarios | No se siguen. Si el método destino puede llegar a un SP, lo reporta como "Llamada no resuelta". |
+| Llamadas por reflexión (`GetMethod(...).Invoke`), `dynamic` o delegados guardados en diccionarios (`_acciones[tipo]()`) | No se siguen y, en general, **no generan advertencia**: el endpoint queda sin ese SP y, si ningún otro endpoint llega al método, el SP aparece en la sección 7.3. La advertencia "Llamada no resuelta" solo aparece cuando una llamada por nombre no se pudo conectar (receptor de tipo desconocido y más de 3 clases candidatas) y alguna candidata llega a un SP. |
+| El comentario de un método llamador nombra varios SP migrados y la query no tiene comentario propio | El reporte asocia todos esos SP a la query, con &dagger;, y deja la advertencia "Asociación ambigua". Revisa el código para saber qué SP reemplaza cada query. |
+| El handler de una Minimal API no se puede resolver (por ejemplo, un delegado que llega desde otra parte) | Advertencia "Endpoint". El endpoint aparece en "Endpoints sin SP" con el motivo "Handler no resuelto". |
 | Un campo delegado al que el constructor le asigna una lambda (`_ejecutar = () => _repo.Listar();`) y que después se invoca (`_ejecutar()`) | No se sigue. El endpoint queda en "Endpoints sin SP" y, si ningún otro endpoint llega a `_repo.Listar`, su SP aparece en la sección 7.3 (referencias no vinculadas). |
 | Ramas `#if` con símbolos de compilación | Ver 6.6: se pueden contar SP de una rama que no se compila en producción. |
 | Varias clases con el mismo nombre de método y receptor de tipo desconocido | Si hay 3 clases o menos, sigue todas las candidatas y marca la fila con &dagger;. Si hay más, lo reporta como advertencia con los posibles destinos. |
-| Sinónimos de Oracle o packages sin el prefijo `PCK_`/`PKG_` | Agrega el prefijo con `-PackagePrefixes`. Un nombre sin prefijo solo se detecta si se ejecuta con `CommandType.StoredProcedure`. |
+| Sinónimos de Oracle o packages sin el prefijo `PCK_`/`PKG_` | Pasa la lista completa de prefijos con `-PackagePrefixes` (reemplaza a los valores por defecto). Un nombre sin prefijo solo se detecta si se ejecuta con `CommandType.StoredProcedure`. |
 | Lógica dentro de la BD (un SP pendiente que llama a otros SP) | El script solo ve el repo. Si un hijo está migrado en el repo, sí se siguen sus nietos. |
 
 **Revisa siempre la sección 7 del reporte**: ahí está todo lo que el análisis no pudo afirmar con certeza.
@@ -220,8 +236,11 @@ const string SqlListarVentas = @"
 
 | Problema | Solución |
 |---|---|
-| "No se puede cargar el archivo... la ejecución de scripts está deshabilitada" | Usa `powershell -ExecutionPolicy Bypass -File .\Analizar-SpEndpoints.ps1 ...` o `Unblock-File`. |
-| "PowerShell está en modo ConstrainedLanguage" | Tu equipo restringe `Add-Type`. Ejecútalo desde una consola sin esa restricción o pide una excepción al área de TI. |
+| "No se puede cargar el archivo... la ejecución de scripts está deshabilitada" | La política de ejecución del equipo no permite scripts. Usa `powershell -ExecutionPolicy Bypass -File .\Analizar-SpEndpoints.ps1 ...`. |
+| "No se puede cargar el archivo... no está firmado digitalmente" | El archivo viene de internet (del ZIP) y está bloqueado. Usa `-ExecutionPolicy Bypass` o desbloquéalo con `Unblock-File`. |
+| "PowerShell esta en modo 'ConstrainedLanguage'..." | Tu equipo restringe `Add-Type`. Ejecútalo desde una consola sin esa restricción o pide una excepción al área de TI. |
+| "No se pudo compilar el motor de analisis: ..." sin haber editado el script | Algún control del equipo (AppLocker, antivirus) bloquea la compilación en memoria de `Add-Type`. Pide una excepción al área de TI. |
+| "No se encuentra ningún parámetro de posición que acepte el argumento..." | Una lista se escribió con espacios después de las comas (`-PackagePrefixes PCK_, PKG_`). Con `-File`, escríbela sin espacios: `-PackagePrefixes PCK_,PKG_`. |
 | Aparecen caracteres raros o errores de sintaxis después de editar el script | Guárdalo de nuevo como **UTF-8 con BOM**. |
 | Un endpoint no aparece | Revisa que el controller o el método `Map*` no esté en una carpeta excluida. Con `-SwaggerPath` puedes ver qué endpoints documentados no se detectaron. |
 | Un SP aparece como "Solo en comentario" | El nombre del SP no está escrito en el código (variable, configuración externa, etc.) o la query no se encontró. Revisa el archivo:línea indicado. |
@@ -240,17 +259,29 @@ const string SqlListarVentas = @"
   artifact: reporte-sp
 ```
 
-## 10. Mantenimiento del script (para quien lo modifique)
+## 10. Estructura del script y correcciones en el lugar
 
 El `.ps1` tiene tres partes:
 
-1. **Parámetros y descubrimiento de archivos** (inicio del archivo): rutas por defecto, carpetas excluidas y detección de proyectos de test.
-2. **Motor de análisis en C#** (dentro de `$engineSource = @' ... '@`): lexer, parser, grafo de llamadas, reglas de SP y clasificación. Es C# 5, para que compile con el `Add-Type` de Windows PowerShell 5.1.
-3. **Render del reporte** (final del archivo): textos, tablas y CSV. Es la parte más fácil de personalizar.
+1. **Parámetros y descubrimiento de archivos** (inicio del archivo): rutas por defecto, carpetas excluidas, detección de proyectos de test y de proyectos referenciados fuera de la carpeta analizada.
+2. **Motor de análisis en C#** (dentro de `$engineSource = @' ... '@`): lexer, parser, grafo de llamadas, reglas de SP y clasificación.
+3. **Cruce con Swagger y render del reporte** (final del archivo): textos, tablas y CSV. Es la parte más fácil de personalizar.
 
-Las fuentes separadas del motor, el script `build.ps1` que arma el `.ps1` y los repos de prueba con su resultado esperado están en la carpeta `_desarrollo/`. Ahí también está el comparador `compare.ps1`, que verifica que el script siga dando el resultado esperado después de un cambio:
+El desarrollo del script (fuentes del motor por separado, pruebas de regresión y repos de prueba) se mantiene **fuera de este paquete**: aquí solo está el script ya armado. Si tienes que corregir algo en tu equipo, edita `Analizar-SpEndpoints.ps1` directamente y respeta estas reglas:
+
+| Regla | Por qué |
+|---|---|
+| Guarda el archivo como **UTF-8 con BOM** (en VS Code: *Save with Encoding > UTF-8 with BOM*). | Sin BOM, Windows PowerShell 5.1 lo lee como ANSI y los acentos rompen el script. |
+| El motor es **C# 5**: no uses `$"..."`, `?.`, `nameof`, miembros con `=>`, tuplas, `out var` ni pattern matching. | Es la versión que compila el `Add-Type` de Windows PowerShell 5.1. |
+| Ninguna línea del motor puede empezar con `'@`. | Esa secuencia cierra el here-string que contiene el motor. |
+| En las partes de PowerShell, no uses `→`, `—`, comillas tipográficas, `Ó` ni `Ñ`. | Si alguien guarda el archivo sin BOM, esos bytes rompen el parseo. |
+
+Para comprobar que el archivo sigue siendo válido y que conserva el BOM, ejecuta esto en una consola de Windows PowerShell 5.1 abierta en la carpeta del script. Debe imprimir `errores: 0 - BOM: EF BB BF`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\_desarrollo\build.ps1
-powershell -ExecutionPolicy Bypass -File .\_desarrollo\compare.ps1
+$f = (Resolve-Path .\Analizar-SpEndpoints.ps1).Path; $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$e); $b = Get-Content $f -Encoding Byte -TotalCount 3; 'errores: {0} - BOM: {1}' -f $e.Count, (($b | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')
 ```
+
+Ese comando no revisa el C# del motor: los errores de compilación aparecen al ejecutar el script, como "No se pudo compilar el motor de analisis: ...". El motor se compila con un nombre derivado de su contenido, así que cada cambio se recompila solo; no hace falta cerrar la consola.
+
+Para no perder la corrección en la próxima versión, descríbela de forma genérica, sin código real ni nombres de la empresa y con un ejemplo mínimo inventado, para que se incorpore a las fuentes de desarrollo. El prompt de verificación indica cómo.

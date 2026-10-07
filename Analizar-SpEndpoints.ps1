@@ -60,7 +60,7 @@
 .EXAMPLE
     .\Analizar-SpEndpoints.ps1 -RepoPath ..\..\carpeta-api\src -OutputPath ..\reportes\sp.md -ExportCsv
 #>
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Alias('Repo', 'Ruta', 'Path')]
     [string]$RepoPath,
@@ -88,6 +88,10 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+# antes que cualquier otra cosa: en ConstrainedLanguage fallarian New-Object y Add-Type con mensajes confusos
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    throw "PowerShell esta en modo '$($ExecutionContext.SessionState.LanguageMode)'. El script necesita FullLanguage para compilar su motor de analisis (Add-Type)."
+}
 
 # Con "powershell -File", una lista 'A','B' llega como un unico texto "A,B": se separa aqui.
 function Split-ListParam([string[]]$values) {
@@ -109,7 +113,7 @@ foreach ($p in @($PackagePrefixes) + @($ObjectPrefixes)) {
 }
 if (@($PackagePrefixes).Count -eq 0) { $PackagePrefixes = @('PCK_', 'PKG_') }
 if (@($ObjectPrefixes).Count -eq 0) { $ObjectPrefixes = @('SP_', 'FN_', 'PRC_') }
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
 # ---------------------------------------------------------------- rutas por defecto
@@ -135,13 +139,10 @@ if ([System.IO.Path]::GetExtension($OutputPath) -ne '.md') {
 $outDir = Split-Path -Parent $OutputPath
 if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
-if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
-    throw "PowerShell esta en modo '$($ExecutionContext.SessionState.LanguageMode)'. El script necesita FullLanguage para compilar su motor de analisis (Add-Type)."
-}
-
 Write-Host "Analizar-SpEndpoints v$ScriptVersion" -ForegroundColor Cyan
 Write-Host "  Repositorio : $RepoPath"
 Write-Host "  Salida      : $OutputPath"
+Write-Host ("  PowerShell  : {0} {1} ({2})" -f $PSVersionTable.PSVersion, $PSVersionTable.PSEdition, $ExecutionContext.SessionState.LanguageMode)
 
 # ---------------------------------------------------------------- descubrimiento de archivos
 $excludedDirNames = @('bin', 'obj', '.git', '.vs', '.vscode', '.idea', 'node_modules', 'TestResults', '.github', '.gitlab', '.azuredevops', '.claude', '.config')
@@ -242,6 +243,32 @@ if (-not $IncludeTests) {
     $excludedTests = $before - $csFiles.Count
 }
 else { $excludedTests = 0 }
+
+# ---------------------------------------------------------------- proyectos referenciados fuera de la carpeta analizada
+# si un proyecto referencia (ProjectReference) otro que esta fuera de -RepoPath, las llamadas a ese codigo no se pueden seguir
+$outsideRefs = [ordered]@{}   # ruta del proyecto referenciado -> proyectos que lo referencian
+$repoPrefix = $RepoPath.TrimEnd('\') + '\'
+$repoUri = New-Object System.Uri $repoPrefix
+foreach ($p in $csprojFiles) {
+    $isTestProj = $false
+    foreach ($t in $testDirs) { if ($p.StartsWith($t, [System.StringComparison]::OrdinalIgnoreCase)) { $isTestProj = $true; break } }
+    if ($isTestProj) { continue }
+    try { $txt = [System.IO.File]::ReadAllText($p) } catch { continue }
+    $pdir = [System.IO.Path]::GetDirectoryName($p)
+    foreach ($m in [regex]::Matches($txt, '(?i)<ProjectReference\s+Include\s*=\s*"([^"]+)"')) {
+        $inc = $m.Groups[1].Value.Replace('/', '\')
+        if ($inc.Contains('$(')) { continue }
+        try { $full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($pdir, $inc)) } catch { continue }
+        if ($full.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $shown = [System.Uri]::UnescapeDataString($repoUri.MakeRelativeUri((New-Object System.Uri $full)).ToString())
+        if (-not $outsideRefs.Contains($shown)) { $outsideRefs[$shown] = New-Object System.Collections.Generic.List[string] }
+        $from = Get-RelPath $p
+        if (-not $outsideRefs[$shown].Contains($from)) { $outsideRefs[$shown].Add($from) }
+    }
+}
+if ($outsideRefs.Count -gt 0) {
+    Write-Warning ("Hay {0} proyecto(s) referenciado(s) fuera de -RepoPath: {1}. Su codigo no se analiza y los SP que se usen ahi no apareceran. Use una carpeta que los incluya (por ejemplo, la raiz del repo)." -f $outsideRefs.Count, ((@($outsideRefs.Keys) | Select-Object -First 5) -join ', '))
+}
 
 Write-Host ("  Archivos    : {0} .cs, {1} .sql, {2} .resx, {3} appsettings  (excluidos {4} .cs de tests)" -f $csFiles.Count, $sqlFiles.Count, $resxFiles.Count, $configFiles.Count, $excludedTests)
 if ($csFiles.Count -eq 0) { Write-Warning "No se encontraron archivos .cs para analizar en $RepoPath" }
@@ -4097,6 +4124,7 @@ namespace SPA_NS
         int fragSeq = 0, markSeq = 0, blockSeq = 0;
         Dictionary<string, MethodAnalysis> cache = new Dictionary<string, MethodAnalysis>();
         Dictionary<string, int> wrapperCache = new Dictionary<string, int>();
+        Dictionary<string, int> commandCache = new Dictionary<string, int>();
         Dictionary<string, List<Marker>> classMarkerCache = new Dictionary<string, List<Marker>>();
 
         static readonly Regex MsgCallee = new Regex(@"^(Log\w*|Write\w*|Trace\w*|Debug\w*|Info|Information|Warn|Warning|Error|Fatal|Critical|Verbose|Print\w*|Assert\w*|Fail|AddError|AddModelError|Append\w*Message)$");
@@ -4672,50 +4700,113 @@ namespace SPA_NS
         // Comandos Dapper cuyo texto no se puede resolver: se informan como advertencia
         void WarnUnresolvedCommands(MethodAnalysis ma, MethodDecl m)
         {
-            var f = m.File; var t = f.Toks; var mt = f.Match;
+            var f = m.File; var t = f.Toks;
+            HashSet<string> wrappers = null;
             foreach (var cs in ix.Calls(m))
             {
-                if (cs.IsNew || cs.IsMethodGroup || cs.ArgOpen < 0 || !DapperExec.IsMatch(cs.Name)) continue;
-                if (cs.Receiver.Count == 0) continue;
-                var args = SplitArgs(f, cs.ArgOpen);
-                if (args.Count == 0) continue;
-                // primer argumento (o "sql:" / "commandText:")
-                int[] a0 = args[0];
-                foreach (var a in args) if (IsI(t, a[0]) && IsP(t, a[0] + 1, ":") && Regex.IsMatch(t[a[0]].Text, "^(sql|commandText|command)$", RegexOptions.IgnoreCase)) { a0 = new int[] { a[0] + 2, a[1] }; break; }
-                if (ma.Fragments.Any(fr => fr.TokStart < a0[1] && fr.TokEnd > a0[0])) continue;
-                // el texto viene de un metodo (ArmarSql(), sb.ToString(), helper.Get()): se sigue por el grafo de llamadas
-                bool hasCall = false;
-                for (int q = a0[0]; q < a0[1]; q++) if (IsP(t, q, "(")) { hasCall = true; break; }
-                if (hasCall) continue;
-                // CommandDefinition / variable con valor conocido / parametro de un wrapper: no se avisa
-                if (IsI(t, a0[0]) && t[a0[0]].Text == "new") continue;
-                // StringBuilder o variable acumulada: sb.ToString() / sql
-                int r0 = a0[0];
-                if (IsI(t, r0) && t[r0].Text == "this" && IsP(t, r0 + 1, ".")) r0 += 2;
-                if (IsI(t, r0) && ma.Fragments.Any(fr => fr.GroupVar == t[r0].Text)) continue;
-                if (a0[1] - a0[0] == 1 && IsI(t, a0[0]))
+                if (cs.IsNew || cs.IsMethodGroup || cs.ArgOpen < 0) continue;
+                // handler.ExecuteAsync(ct), _uow.Query(...): si la llamada se resuelve con certeza a un metodo del repo no es Dapper
+                bool repoMethod = false;
+                if (DapperExec.IsMatch(cs.Name) && cs.Receiver.Count > 0)
                 {
-                    string n = t[a0[0]].Text;
-                    // parametro: en un wrapper lo resuelven sus llamadores; en un endpoint viene de la peticion (dinamico)
-                    if (m.Params.Any(p => p.Name == n) && !EntryMethods.Contains(m.Id)) continue;
-                    LocalInfo li;
-                    if (ix.Locals(m).TryGetValue(n, out li))
-                    {
-                        int declTok = li.ExprTok;
-                        int declEnd = declTok >= 0 ? ix.P(f).FindStmtEnd(declTok, m.BodyEnd) : -1;
-                        if (declTok >= 0 && ma.Fragments.Any(fr => fr.TokStart >= declTok - 3 && fr.TokStart <= declEnd)) continue;
-                        bool initCall = false;
-                        for (int q = Math.Max(0, declTok); declTok >= 0 && q < declEnd; q++) if (IsP(t, q, "(")) { initCall = true; break; }
-                        if (initCall) continue;   // var sql = ArmarSql(): el texto sale de otro metodo
-                        if (ma.Fragments.Any(fr => fr.GroupVar == n)) continue;
-                    }
-                    var mv = ix.ResolveMemberChain(new List<string> { n }, m.Owner);
-                    if (mv != null && ix.ConstValue(mv) != null) continue;
+                    bool rinf, runr;
+                    var rt = ix.ResolveCall(m, cs, out rinf, out runr);
+                    repoMethod = rt.Count > 0 && !rinf;
                 }
-                var sb = new StringBuilder();
-                for (int q = a0[0]; q < a0[1] && q < t.Count; q++) sb.Append(t[q].Kind == TokKind.Str ? "\"" + t[q].Lit.PlainValue() + "\"" : t[q].Text);
-                ma.Warnings.Add(new Warn { Category = "Comando no resuelto", Message = cs.Name + "(" + U.OneLine(sb.ToString(), 80) + "): el texto del comando o el nombre del SP se arma en tiempo de ejecución", Loc = new Location(f, cs.Line) });
+                if (DapperExec.IsMatch(cs.Name) && !repoMethod)
+                {
+                    if (cs.Receiver.Count == 0) continue;
+                    var args = SplitArgs(f, cs.ArgOpen);
+                    if (args.Count == 0) continue;
+                    // primer argumento (o "sql:" / "commandText:")
+                    int[] a0 = args[0];
+                    foreach (var a in args) if (IsI(t, a[0]) && IsP(t, a[0] + 1, ":") && Regex.IsMatch(t[a[0]].Text, "^(sql|commandText|command)$", RegexOptions.IgnoreCase)) { a0 = new int[] { a[0] + 2, a[1] }; break; }
+                    if (!ArgUnresolved(ma, m, a0)) continue;
+                    ma.Warnings.Add(new Warn { Category = "Comando no resuelto", Message = cs.Name + "(" + ArgText(t, a0) + "): el texto del comando o el nombre del SP se arma en tiempo de ejecución", Loc = new Location(f, cs.Line) });
+                    continue;
+                }
+                // wrapper del repo que ejecuta con CommandType.StoredProcedure el string que recibe: se revisa el argumento que se le pasa
+                if (wrappers == null) wrappers = WrapperNames();
+                if (!wrappers.Contains(cs.Name)) continue;
+                bool inf, unr;
+                foreach (var tg in ix.ResolveCall(m, cs, out inf, out unr))
+                {
+                    int wi = CommandParamIndex(tg, 0, false);
+                    if (wi < 0) continue;
+                    var args = SplitArgs(f, cs.ArgOpen);
+                    string pname = tg.Params[wi + (tg.IsExtension ? 1 : 0)].Name;
+                    int[] aw = null;
+                    foreach (var a in args) if (IsI(t, a[0]) && IsP(t, a[0] + 1, ":")) { if (t[a[0]].Text == pname) { aw = new int[] { a[0] + 2, a[1] }; break; } }
+                    if (aw == null && wi < args.Count && !(IsI(t, args[wi][0]) && IsP(t, args[wi][0] + 1, ":"))) aw = args[wi];
+                    if (aw == null || !ArgUnresolved(ma, m, aw)) break;
+                    string que = WrapperParamIndex(tg, 0) == wi ? "el nombre del SP" : "el texto del comando";
+                    ma.Warnings.Add(new Warn { Category = "Comando no resuelto", Message = cs.Name + "(..." + ArgText(t, aw) + "...): " + que + " llega por el parámetro '" + pname + "' y su valor no se puede evaluar", Loc = new Location(f, cs.Line) });
+                    break;
+                }
             }
+        }
+
+        static string ArgText(List<Token> t, int[] a)
+        {
+            var sb = new StringBuilder();
+            for (int q = a[0]; q < a[1] && q < t.Count; q++) sb.Append(t[q].Kind == TokKind.Str ? "\"" + t[q].Lit.PlainValue() + "\"" : t[q].Text);
+            return U.OneLine(sb.ToString(), 80);
+        }
+
+        // true si el argumento (texto de un comando o nombre de un SP) no tiene un valor conocido y no se resuelve por otro camino
+        bool ArgUnresolved(MethodAnalysis ma, MethodDecl m, int[] a0)
+        {
+            var f = m.File; var t = f.Toks;
+            if (a0[1] <= a0[0]) return false;
+            if (ma.Fragments.Any(fr => fr.TokStart < a0[1] && fr.TokEnd > a0[0])) return false;
+            // el texto viene de un metodo (ArmarSql(), sb.ToString(), helper.Get()): se sigue por el grafo de llamadas
+            for (int q = a0[0]; q < a0[1]; q++) if (IsP(t, q, "(")) return false;
+            // CommandDefinition / new XCommand(...)
+            if (IsI(t, a0[0]) && t[a0[0]].Text == "new") return false;
+            // StringBuilder o variable acumulada: sb.ToString() / sql
+            int r0 = a0[0];
+            if (IsI(t, r0) && t[r0].Text == "this" && IsP(t, r0 + 1, ".")) r0 += 2;
+            if (IsI(t, r0) && ma.Fragments.Any(fr => fr.GroupVar == t[r0].Text)) return false;
+            if (a0[1] - a0[0] == 1 && IsI(t, a0[0]))
+            {
+                string n = t[a0[0]].Text;
+                if (U.IsKeyword(n)) return false;
+                // parametro: en un wrapper lo resuelven sus llamadores; en un endpoint viene de la peticion (dinamico)
+                if (m.Params.Any(p => p.Name == n) && !EntryMethods.Contains(m.Id)) return false;
+                LocalInfo li;
+                if (ix.Locals(m).TryGetValue(n, out li))
+                {
+                    int declTok = li.ExprTok;
+                    int declEnd = declTok >= 0 ? ix.P(f).FindStmtEnd(declTok, m.BodyEnd) : -1;
+                    if (declTok >= 0 && ma.Fragments.Any(fr => fr.TokStart >= declTok - 3 && fr.TokStart <= declEnd)) return false;
+                    bool initCall = false;
+                    for (int q = Math.Max(0, declTok); declTok >= 0 && q < declEnd; q++)
+                    {
+                        // "x ?? throw new X(...)": lo que sigue a ?? / throw no aporta el valor
+                        if (IsP(t, q, "??") || (IsI(t, q) && t[q].Text == "throw")) break;
+                        if (IsP(t, q, "(")) { initCall = true; break; }
+                    }
+                    if (initCall) return false;   // var sql = ArmarSql(): el texto sale de otro metodo
+                    if (ma.Fragments.Any(fr => fr.GroupVar == n)) return false;
+                }
+                var mv = ix.ResolveMemberChain(new List<string> { n }, m.Owner);
+                if (mv != null && ix.ConstValue(mv) != null) return false;
+            }
+            return true;
+        }
+
+        HashSet<string> wrapperNames;
+        HashSet<string> WrapperNames()
+        {
+            if (wrapperNames != null) return wrapperNames;
+            wrapperNames = new HashSet<string>();
+            foreach (var md in ix.Methods)
+            {
+                if (!md.HasBody || wrapperNames.Contains(md.Name)) continue;
+                if (!md.Params.Any(p => !p.IsThis && p.Type != null && (p.Type.Name == "string" || p.Type.Name == "String"))) continue;
+                if (CommandParamIndex(md, 0, false) >= 0) wrapperNames.Add(md.Name);
+            }
+            return wrapperNames;
         }
 
         void EnclosingCall(MethodDecl m, int tokStart, int tokEnd, out string callee, out bool isNew, out int argIndex, out string namedArg, out int open)
@@ -4776,15 +4867,20 @@ namespace SPA_NS
 
         // Indice (sin contar "this") del parametro string que termina como texto de un comando con
         // CommandType.StoredProcedure (directamente o pasando por otro wrapper). -1 si no es un wrapper.
-        public int WrapperParamIndex(MethodDecl md, int depth)
+        public int WrapperParamIndex(MethodDecl md, int depth) { return CommandParamIndex(md, depth, true); }
+
+        // Igual que WrapperParamIndex, pero con requireSp=false tambien cuenta el texto SQL que se ejecuta sin CommandType.StoredProcedure
+        public int CommandParamIndex(MethodDecl md, int depth, bool requireSp)
         {
             int r;
-            if (wrapperCache.TryGetValue(md.Id, out r)) return r;
-            wrapperCache[md.Id] = -1;
+            var cache = requireSp ? wrapperCache : commandCache;
+            if (cache.TryGetValue(md.Id, out r)) return r;
+            cache[md.Id] = -1;
             r = -1;
-            if (md.HasBody && depth < 4 && BodyHasIdent(md, "StoredProcedure"))
+            if (md.HasBody && depth < 4)
             {
-                var t = md.File.Toks; var mt = md.File.Match;
+                var t = md.File.Toks;
+                bool bodySp = BodyHasIdent(md, "StoredProcedure");
                 for (int i = 0; i < md.Params.Count && r < 0; i++)
                 {
                     var p = md.Params[i];
@@ -4793,26 +4889,38 @@ namespace SPA_NS
                     {
                         if (!IsI(t, k) || t[k].Text != p.Name || IsP(t, k - 1, ".")) continue;
                         // CommandText = param
-                        if (IsP(t, k - 1, "=") && IsI(t, k - 2) && t[k - 2].Text == "CommandText") { r = i; break; }
+                        if ((bodySp || !requireSp) && IsP(t, k - 1, "=") && IsI(t, k - 2) && t[k - 2].Text == "CommandText") { r = i; break; }
+                        // el parametro es un argumento completo de una llamada
+                        bool prevOk = IsP(t, k - 1, "(") || IsP(t, k - 1, ",") || (IsP(t, k - 1, ":") && IsI(t, k - 2));
+                        if (!prevOk || !(IsP(t, k + 1, ",") || IsP(t, k + 1, ")"))) continue;
+                        string callee; bool isNew; int argIndex; string named; int open;
+                        EnclosingCall(md, k, k + 1, out callee, out isNew, out argIndex, out named, out open);
+                        if (callee == null || open <= 0) continue;
                         // primer argumento (o sql:/commandText:) de Query*/Execute*/new XCommand(/new CommandDefinition(
-                        bool first = IsP(t, k - 1, "(") || (IsP(t, k - 1, ":") && IsI(t, k - 2) && Regex.IsMatch(t[k - 2].Text, "^(sql|commandText)$", RegexOptions.IgnoreCase));
-                        if (!first || !(IsP(t, k + 1, ",") || IsP(t, k + 1, ")"))) continue;
-                        int open = IsP(t, k - 1, "(") ? k - 1 : -1;
-                        if (open < 0) { int z = k - 2; while (z >= md.BodyStart && !(IsP(t, z, "(") && mt[z] > k)) z--; open = z; }
-                        if (open <= 0 || !IsI(t, open - 1)) continue;
-                        string callee = t[open - 1].Text;
-                        if (ExecCallee.IsMatch(callee)) { r = i; break; }
-                        // otro wrapper del repo
+                        if (ExecCallee.IsMatch(callee))
+                        {
+                            bool first = named != null ? Regex.IsMatch(named, "^(sql|commandText)$", RegexOptions.IgnoreCase) : argIndex == 0;
+                            if (first && (bodySp || !requireSp)) { r = i; break; }
+                        }
+                        if (isNew) continue;
+                        // otro wrapper del repo: el parametro llega a la posicion que ese wrapper ejecuta
                         var cs = new CallSite { Name = callee, Argc = ix.CountArgs(md.File, open), ArgOpen = open };
                         if (open > 1 && IsP(t, open - 2, ".")) cs.Receiver = ix.WalkBack(md.File, open - 2);
                         bool inf, unr;
-                        foreach (var tg in ix.ResolveCall(md, cs, out inf, out unr)) if (tg != md && WrapperParamIndex(tg, depth + 1) == 0) { r = i; break; }
+                        foreach (var tg in ix.ResolveCall(md, cs, out inf, out unr))
+                        {
+                            if (tg == md) continue;
+                            int wi = CommandParamIndex(tg, depth + 1, requireSp);
+                            if (wi < 0) continue;
+                            bool hit = named != null ? tg.Params[wi + (tg.IsExtension ? 1 : 0)].Name == named : argIndex == wi;
+                            if (hit) { r = i; break; }
+                        }
                         if (r >= 0) break;
                     }
                 }
             }
             if (r >= 0 && md.IsExtension) r -= 1;
-            wrapperCache[md.Id] = r;
+            cache[md.Id] = r;
             return r;
         }
     }
@@ -6620,6 +6728,12 @@ W ("> Generado el {0} con ``Analizar-SpEndpoints.ps1`` v{1}  " -f $now, $ScriptV
 W ("> Carpeta analizada: {0}  " -f (Code $RepoPath))
 W ("> Prefijos de package: {0} &middot; Prefijos de SP/funciones sin package: {1}" -f (($PackagePrefixes | ForEach-Object { '`' + $_ + '`' }) -join ', '), (($ObjectPrefixes | ForEach-Object { '`' + $_ + '`' }) -join ', '))
 W ''
+if ($outsideRefs.Count -gt 0) {
+    W ('> **&#9888; Análisis incompleto:** hay {0} proyecto(s) referenciado(s) fuera de la carpeta analizada. Su código no se leyó, así que los SP que se usen ahí no aparecen en este reporte. Vuelva a ejecutar con un `-RepoPath` que los incluya (por ejemplo, la raíz del repo).' -f $outsideRefs.Count)
+    W '>'
+    foreach ($k in $outsideRefs.Keys) { W ('> - {0} (referenciado por {1})' -f (Code $k), ((@($outsideRefs[$k]) | ForEach-Object { Code $_ }) -join ', ')) }
+    W ''
+}
 W '## Resumen'
 W ''
 W '| Indicador | Valor |'
@@ -6645,7 +6759,7 @@ W '- **Llamado directamente (dentro de query)**: el SP o la función aparece den
 W '- **Migrado sin hijos (listo)**: un comentario nombra el SP y la query que lo reemplaza ya no llama a ningún SP.'
 W '- **SP hijo**: la query que reemplazó al SP de la segunda columna todavía llama al SP de la tercera columna. El estado indica si ese hijo ya está migrado en otro lugar del repo. Si lo está, sus propios hijos aparecen como "nivel 2", "nivel 3", etc.'
 W '- **Solo en comentario (revisar)**: el SP se nombra en el flujo del endpoint, pero no hay código que lo respalde. Pasa, por ejemplo, cuando el nombre del SP viene de una variable o cuando no se encontró la query.'
-W '- &dagger; = asociación inferida: el SP migrado se toma del comentario de un método llamador (por ejemplo, la acción del controller), o la llamada se resolvió solo por el nombre del método.'
+W '- &dagger; = asociación inferida: el SP migrado se toma del comentario de un método llamador (por ejemplo, la acción del controller) o del comentario de la clase, o la llamada se resolvió solo por el nombre del método.'
 W ''
 
 # --- 1. tabla principal
@@ -6862,11 +6976,11 @@ W '  2. comentario sobre la constante SQL;'
 W '  3. comentario previo en el mismo método, dentro de su bloque `{ }`;'
 W '  4. XML doc, comentarios o atributos del método (las menciones en logs, solo si no hay nada de lo anterior);'
 W '  5. documentación del método de la interfaz o comentario de un método llamador (&dagger;);'
-W '  6. comentario de la clase, solo si nombra un único SP.'
+W '  6. comentario de la clase, solo si nombra un único SP (&dagger;).'
 W '- Las queries armadas con `StringBuilder`, `+=`, `string.Format` o `AppendFormat` se unen en una sola query. Los strings que no son comandos se ignoran: comparaciones, valores de parámetros y respuestas HTTP.'
 W '- Un comentario que nombra un SP que la misma query ya llama solo documenta esa llamada; no la convierte en migración.'
 W '- Exclusiones:'
-W '  - las carpetas `bin`, `obj`, `.git`, `node_modules` y `packages`, y las de documentación (`docs`, ...);'
+W '  - las carpetas `bin`, `obj`, `.git`, `.vs` y `node_modules`; `packages` y `artifacts` en la raíz; en las de documentación (`docs`, ...) solo se leen los `.cs`;'
 W '  - los proyectos de test y los archivos generados (`*.g.cs`, `*.Designer.cs`);'
 W '  - los `.sql` que el código C# no referencia por nombre.'
 W '- No se detectan los nombres de SP que se arman en tiempo de ejecución concatenando variables. Si se encuentra un caso así, aparece como advertencia "SP dinámico".'

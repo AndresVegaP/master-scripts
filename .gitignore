@@ -1,16 +1,15 @@
+# Desarrollo: fuentes del motor, build, pruebas y fixtures.
+# Es un repo git local aparte (sin remoto) y NO se publica en GitHub.
+/_desarrollo/
+
 # Reportes generados: pueden contener rutas, nombres de SP y código de repos de la empresa.
 # NUNCA versionarlos en este repositorio.
 /reportes/
 /reporte-sp-endpoints.md
 /reporte-sp-endpoints.csv
-*.out/
 
-# Copia de archivos modificados en el PC de la empresa (se revisan y se suben a mano)
-cambios-herramienta/
-
-# Salidas y casos temporales de desarrollo
-_desarrollo/out/
-_desarrollo/adversarial/
+# Material que vuelve del PC de la empresa (se integra en _desarrollo, no se sube directo)
+/cambios-herramienta/
 
 # Workspaces locales de VS Code
 *.code-workspace

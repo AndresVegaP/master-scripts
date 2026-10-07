@@ -1,4 +1,0 @@
-Pendientes de migración (notas sueltas del equipo):
-- PCK_STOCK.SP_VALIDAR: revisar con el DBA si se puede eliminar
-- PCK_NOTAS.SP_SOLO_TXT(:id) aparece solo en este archivo
-- Revisar el reproceso nocturno: CALL PCK_VENTAS.SP_REPROCESAR_NOCHE();

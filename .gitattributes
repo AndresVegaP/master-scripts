@@ -2,3 +2,7 @@
 *.ps1 text eol=crlf
 *.cs text eol=crlf
 *.md text eol=crlf
+
+# el ZIP de GitHub (Code > Download ZIP) lleva solo lo necesario para usar la herramienta
+.gitattributes export-ignore
+.gitignore export-ignore
