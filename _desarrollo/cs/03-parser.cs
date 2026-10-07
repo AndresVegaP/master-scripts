@@ -73,7 +73,7 @@ namespace SPA_NS
                         if (!IsP(k, "(") && !IsId(k, "var") && !(IsIdent(k) && IsIdent(k + 1) && IsP(k + 2, "=")))
                         {
                             int semi = FindStmtEnd(k, e);
-                            RecordUsing(k, semi);
+                            RecordUsing(k, semi, x == "global");
                             i = semi + 1; continue;
                         }
                     }
@@ -143,19 +143,37 @@ namespace SPA_NS
             return IsTypeDeclAt(k) || IsId(k, "delegate");
         }
 
-        void RecordUsing(int k, int semi)
+        void RecordUsing(int k, int semi, bool isGlobal)
         {
             bool isStatic = false;
             if (IsId(k, "static")) { isStatic = true; k++; }
+            // alias: using Repo = A.B.ClientesRepository;  using IRepo = A.IGenerico<A.Cliente>;
+            if (IsIdent(k) && IsP(k + 1, "="))
+            {
+                string alias = t[k].Text;
+                var ab = new StringBuilder();
+                for (int j = k + 2; j < semi; j++) { if (IsP(j, "<")) break; ab.Append(t[j].Text); }
+                string target = ab.ToString().Replace("global::", "");
+                if (target.Length > 0)
+                {
+                    f.Aliases[alias] = target;
+                    if (isGlobal) f.GlobalAliases[alias] = target;
+                }
+                return;
+            }
             var sb = new StringBuilder();
             for (int j = k; j < semi; j++)
             {
-                if (IsP(j, "=")) return; // alias
                 if (IsP(j, "<")) break;
                 sb.Append(t[j].Text);
             }
             string u = sb.ToString().Replace("global::", "");
-            if (u.Length > 0) f.Usings.Add(isStatic ? "static:" + u : u);
+            if (u.Length > 0)
+            {
+                string val = isStatic ? "static:" + u : u;
+                f.Usings.Add(val);
+                if (isGlobal) f.GlobalUsings.Add(val);
+            }
         }
 
         int HandleTopLevel(int i, int e)
@@ -193,6 +211,7 @@ namespace SPA_NS
                 topProgram = new TypeDecl { Name = "Program", Namespace = "", FullName = "Program", Kind = "class", File = f, Line = t[i].Line, IsPartial = true };
                 topProgram.Files.Add(f);
                 topProgram.Usings = f.Usings;
+                topProgram.Aliases = f.Aliases;
                 topProgram.Id = "T" + (++seq);
                 Types.Add(topProgram);
             }
@@ -223,6 +242,7 @@ namespace SPA_NS
             td.FullName = (outer != null ? outer.FullName + "." : (ns.Length > 0 ? ns + "." : "")) + td.Name;
             td.Leading = CommentsBefore(declStart, k);
             td.Usings = f.Usings;
+            td.Aliases = f.Aliases;
             td.Files.Add(f);
             k++;
             if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) { td.TypeParams = GenericParamNames(k, g); k = g + 1; } }
@@ -268,7 +288,19 @@ namespace SPA_NS
         {
             int k = i;
             var x = t[k];
-            if (IsP(k, "~")) return SkipUnknown(i, e);
+            // finalizador: ~Nombre() { }
+            if (IsP(k, "~"))
+            {
+                if (IsIdent(k + 1) && IsP(k + 2, "(") && M(k + 2) > 0)
+                {
+                    var fm = NewMethod("~" + t[k + 1].Text, td, k + 1, declStart, attrs, mods);
+                    int fk = M(k + 2) + 1;
+                    ParseBody(ref fk, fm);
+                    Register(fm, td);
+                    return Math.Max(fk, i + 1);
+                }
+                return SkipUnknown(i, e);
+            }
             if (x.Kind == TokKind.Ident && x.Text == td.Name && IsP(k + 1, "("))
             {
                 int c = M(k + 1);
@@ -294,17 +326,69 @@ namespace SPA_NS
                 Register(md, td);
                 return k;
             }
-            if (x.Kind == TokKind.Ident && (x.Text == "event" || x.Text == "implicit" || x.Text == "explicit" || x.Text == "delegate"))
+            // C# 14: extension(Tipo receptor) { miembros }
+            if (x.Kind == TokKind.Ident && x.Text == "extension" && IsP(k + 1, "(") && M(k + 1) > 0 && IsP(M(k + 1) + 1, "{"))
+            {
+                int pc = M(k + 1);
+                var recv = ParseParams(k + 1, pc);
+                int open = pc + 1, close = M(open);
+                if (close < 0) return SkipUnknown(i, e);
+                int before = td.Methods.Count;
+                ParseScope(open + 1, close, td.Namespace, td, false);
+                if (recv.Count > 0)
+                {
+                    var rp = recv[0]; rp.IsThis = true;
+                    for (int q = before; q < td.Methods.Count; q++)
+                    {
+                        var em = td.Methods[q];
+                        if (em.Params.Count == 0 || !em.Params[0].IsThis) em.Params.Insert(0, rp);
+                        em.IsExtension = true; em.IsStatic = true;
+                    }
+                }
+                return close + 1;
+            }
+            if (x.Kind == TokKind.Ident && x.Text == "delegate") return SkipUnknown(i, e);
+            // evento con accesores: event Tipo Nombre { add { } remove { } }
+            if (x.Kind == TokKind.Ident && x.Text == "event")
+            {
+                int ek = k + 1;
+                var et = ParseTypeRef(ref ek);
+                if (et != null && IsIdent(ek) && IsP(ek + 1, "{") && M(ek + 1) > 0)
+                {
+                    ParseAccessors(t[ek].Text, ek, ek + 1, td, declStart, attrs, mods, null);
+                    return M(ek + 1) + 1;
+                }
                 return SkipUnknown(i, e);
+            }
+            // operadores de conversion: implicit/explicit operator T(...)
+            if (x.Kind == TokKind.Ident && (x.Text == "implicit" || x.Text == "explicit"))
+                return ParseOperator(i, e, k, declStart, attrs, mods, td);
             if (x.Kind != TokKind.Ident && !IsP(k, "(")) return SkipUnknown(i, e);
 
             TypeRef type = ParseTypeRef(ref k);
             if (type == null) return SkipUnknown(i, e);
-            if (IsId(k, "operator")) return SkipUnknown(i, e);
-            if (IsId(k, "this") && IsP(k + 1, "[")) return SkipUnknown(i, e);
+            if (IsId(k, "operator")) return ParseOperator(i, e, k, declStart, attrs, mods, td);
+            // indexador: Tipo this[...] { get { } set { } }  /  => expr;
+            if (IsId(k, "this") && IsP(k + 1, "[") && M(k + 1) > 0)
+            {
+                int bc = M(k + 1);
+                var ip = ParseParams(k + 1, bc);
+                int ik = bc + 1;
+                if (IsP(ik, "{") && M(ik) > 0) { ParseAccessors("this[]", k, ik, td, declStart, attrs, mods, ip); return M(ik) + 1; }
+                if (IsP(ik, "=>"))
+                {
+                    var gm = NewMethod("this[]", td, k, declStart, attrs, mods);
+                    gm.AccessorKind = "get"; gm.Params = ip; gm.ReturnType = type;
+                    ParseBody(ref ik, gm);
+                    Register(gm, td);
+                    return ik;
+                }
+                return SkipUnknown(i, e);
+            }
             if (!IsIdent(k)) return SkipUnknown(i, e);
             string name = t[k].Text;
             int nameTok = k;
+            string explicitIface = null;
             k++;
             int guard = 0;
             while (guard++ < 20)
@@ -312,10 +396,10 @@ namespace SPA_NS
                 if (IsP(k, "<"))
                 {
                     int g = SkipGeneric(k);
-                    if (g > 0 && IsP(g + 1, ".") && IsIdent(g + 2)) { name = t[g + 2].Text; nameTok = g + 2; k = g + 3; continue; }
+                    if (g > 0 && IsP(g + 1, ".") && IsIdent(g + 2)) { explicitIface = name; name = t[g + 2].Text; nameTok = g + 2; k = g + 3; continue; }
                     break;
                 }
-                if (IsP(k, ".") && IsIdent(k + 1)) { name = t[k + 1].Text; nameTok = k + 1; k += 2; continue; }
+                if (IsP(k, ".") && IsIdent(k + 1)) { explicitIface = name; name = t[k + 1].Text; nameTok = k + 1; k += 2; continue; }
                 break;
             }
             List<string> mtp = null;
@@ -326,6 +410,7 @@ namespace SPA_NS
                 if (c < 0) return SkipUnknown(i, e);
                 var md = NewMethod(name, td, nameTok, declStart, attrs, mods);
                 md.ReturnType = type;
+                md.ExplicitIface = explicitIface;
                 if (mtp != null) md.TypeParams = mtp;
                 md.Params = ParseParams(k, c);
                 md.IsExtension = md.Params.Count > 0 && md.Params[0].IsThis;
@@ -356,6 +441,8 @@ namespace SPA_NS
                         break;
                     }
                 }
+                // cuerpos de los accesores como metodos (para seguir llamadas y SP dentro de get/set)
+                ParseAccessors(name, nameTok, k, td, declStart, attrs, mods, null, type, explicitIface);
                 k = c + 1;
                 if (IsP(k, "="))
                 {
@@ -373,6 +460,11 @@ namespace SPA_NS
                 int end = FindStmtEnd(k + 1, t.Count);
                 mv.InitStart = k + 1; mv.InitEnd = end;
                 AddVar(td, mv);
+                // propiedad de solo lectura con cuerpo de expresion: accesor get
+                var gm = NewMethod(name, td, nameTok, declStart, attrs, mods);
+                gm.AccessorKind = "get"; gm.ReturnType = type; gm.ExplicitIface = explicitIface;
+                gm.BodyStart = k + 1; gm.BodyEnd = end;
+                Register(gm, td);
                 return end + 1;
             }
             if (IsP(k, "=") || IsP(k, ";") || IsP(k, ","))
@@ -395,6 +487,55 @@ namespace SPA_NS
                 return k;
             }
             return SkipUnknown(i, e);
+        }
+
+        void ParseAccessors(string name, int nameTok, int open, TypeDecl td, int declStart, List<AttrInfo> attrs, HashSet<string> mods, List<ParamInfo> idxParams)
+        {
+            ParseAccessors(name, nameTok, open, td, declStart, attrs, mods, idxParams, null, null);
+        }
+
+        // { [attr] [mod] get => x; set { ... } init; add {...} remove {...} }
+        void ParseAccessors(string name, int nameTok, int open, TypeDecl td, int declStart, List<AttrInfo> attrs, HashSet<string> mods, List<ParamInfo> idxParams, TypeRef type, string explicitIface)
+        {
+            int close = M(open);
+            if (close < 0) return;
+            int j = open + 1;
+            int guard = 0;
+            while (j < close && guard++ < 50)
+            {
+                while (IsP(j, "[") && M(j) > j && M(j) < close) j = M(j) + 1;
+                while (IsIdent(j) && (t[j].Text == "private" || t[j].Text == "protected" || t[j].Text == "internal" || t[j].Text == "public" || t[j].Text == "readonly")) j++;
+                if (!IsIdent(j)) { j++; continue; }
+                string kw = t[j].Text;
+                if (kw != "get" && kw != "set" && kw != "init" && kw != "add" && kw != "remove") { j++; continue; }
+                int b = j + 1;
+                if (IsP(b, ";")) { j = b + 1; continue; }   // accesor automatico
+                var am = NewMethod(name, td, nameTok, declStart, attrs, mods);
+                am.AccessorKind = kw == "init" ? "set" : kw;
+                am.ReturnType = type;
+                am.ExplicitIface = explicitIface;
+                if (idxParams != null) am.Params = new List<ParamInfo>(idxParams);
+                if (kw != "get") am.Params.Add(new ParamInfo { Name = "value" });
+                ParseBody(ref b, am);
+                if (am.HasBody) Register(am, td);
+                j = Math.Max(b, j + 1);
+            }
+        }
+
+        // operadores: Tipo operator +(...) { }  /  implicit operator T(...) => ...
+        int ParseOperator(int i, int e, int k, int declStart, List<AttrInfo> attrs, HashSet<string> mods, TypeDecl td)
+        {
+            int j = k;
+            while (j < e && !IsP(j, "(")) j++;
+            if (j >= e || M(j) < 0) return SkipUnknown(i, e);
+            var sb = new StringBuilder("op_");
+            for (int q = k + 1; q < j; q++) sb.Append(t[q].Text);
+            var om = NewMethod(sb.ToString(), td, k, declStart, attrs, mods);
+            om.Params = ParseParams(j, M(j));
+            int b = M(j) + 1;
+            ParseBody(ref b, om);
+            if (om.HasBody) Register(om, td);
+            return Math.Max(b, i + 1);
         }
 
         MethodDecl NewMethod(string name, TypeDecl td, int nameTok, int declStart, List<AttrInfo> attrs, HashSet<string> mods)

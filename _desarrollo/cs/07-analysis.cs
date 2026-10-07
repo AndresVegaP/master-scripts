@@ -113,6 +113,15 @@ namespace SPA_NS
             {
                 try { LoadConfig(path); } catch (Exception ex) { Res.ParseErrors.Add(Rel(path) + ": " + ex.Message); }
             }
+            // global using / global using static / alias globales: aplican a todos los archivos
+            var gUsings = Ix.Files.SelectMany(x => x.GlobalUsings).Distinct().ToList();
+            var gAliases = new Dictionary<string, string>();
+            foreach (var x in Ix.Files) foreach (var kv in x.GlobalAliases) gAliases[kv.Key] = kv.Value;
+            foreach (var x in Ix.Files)
+            {
+                foreach (var u in gUsings) if (!x.Usings.Contains(u)) x.Usings.Add(u);
+                foreach (var kv in gAliases) if (!x.Aliases.ContainsKey(kv.Key)) x.Aliases[kv.Key] = kv.Value;
+            }
             Ix.Build(types, methods);
             Res.FilesCs = Ix.Files.Count; Res.FilesSql = Ix.SqlFiles.Count; Res.Types = Ix.Types.Count; Res.Methods = Ix.Methods.Count;
             Fx = new FragmentExtractor(Ix, Sm);
@@ -150,7 +159,10 @@ namespace SPA_NS
                 if (ep.Handler != null)
                 {
                     var visited = new Dictionary<string, int>();
+                    curMarkerTrace = new Dictionary<string, string>();
+                    foreach (var mk in ep.ExtraMarkers) curMarkerTrace[mk.Id] = ep.HandlerName;
                     Dfs(ep, ep.Handler, ep.ViaType, ep.ExtraMarkers, "ep", 0, new List<string>(), false, visited, items, markers, used, visitedAll, trace, unresolved, warns);
+                    epMarkerTrace[ep.Id] = curMarkerTrace;
                 }
                 foreach (var it in items) AddToCatalog(it.Fr, it.Dec);
                 perEp[ep.Id] = items; epMarkers[ep.Id] = markers; epUsed[ep.Id] = used;
@@ -263,7 +275,12 @@ namespace SPA_NS
                  Dictionary<string, int> visited, List<RawItem> items, List<Marker> markers, HashSet<string> used, HashSet<string> visitedAll,
                  List<string> trace, HashSet<string> unresolved, List<Warn> warns)
         {
-            if (m == null || depth > Opt.MaxDepth) return;
+            if (m == null) return;
+            if (depth > Opt.MaxDepth)
+            {
+                if (m.HasBody) warns.Add(new Warn { Category = "Profundidad máxima", Message = "Se alcanzó -MaxDepth (" + Opt.MaxDepth + ") al llegar a " + m.DisplayName + ": puede haber SP más profundos sin analizar (use un -MaxDepth mayor)", Loc = new Location(m.File, m.Line) });
+                return;
+            }
             string key = m.Id + "|" + inhKey + "|" + (thisType != null ? thisType.Id : "-");
             int prevDepth;
             // se vuelve a visitar si ahora se llega por un camino mas corto (el anterior pudo cortarse por -MaxDepth)
@@ -278,12 +295,14 @@ namespace SPA_NS
             markers.AddRange(ma.MethodMarkers);
             markers.AddRange(ma.WeakMarkers);
             foreach (var b in ma.Blocks) markers.AddRange(b.Markers);
+            foreach (var mk in ma.MethodMarkers.Concat(ma.WeakMarkers).Concat(ma.Blocks.SelectMany(b => b.Markers))) if (!curMarkerTrace.ContainsKey(mk.Id)) curMarkerTrace[mk.Id] = traceStr;
             warns.AddRange(ma.Warnings);
             foreach (var fr in ma.Fragments)
             {
                 if (fr.MessageContext) continue;
                 var dec = Decide(fr, ma, inherited);
                 markers.AddRange(fr.InlineMarkers); markers.AddRange(fr.ConstMarkers);
+                foreach (var mk in fr.InlineMarkers.Concat(fr.ConstMarkers)) if (!curMarkerTrace.ContainsKey(mk.Id)) curMarkerTrace[mk.Id] = traceStr;
                 foreach (var u in dec.Used) used.Add(u.Id);
                 items.Add(new RawItem { Fr = fr, Dec = dec, Trace = traceStr, InferredPath = inferredPath });
                 if (fr.HasDynamicSp)
@@ -320,6 +339,7 @@ namespace SPA_NS
                     if (!x.M.HasBody && x.M.Owner != null && (x.M.Owner.Kind == "interface" || x.M.IsAbstract))
                         foreach (var mk in Fx.Analyze(x.M).MethodMarkers) if (!ifaceMarkers.Any(y => y.Sp.Key == mk.Sp.Key)) ifaceMarkers.Add(mk);
                 markers.AddRange(ifaceMarkers);
+                foreach (var mk in ifaceMarkers) if (!curMarkerTrace.ContainsKey(mk.Id)) curMarkerTrace[mk.Id] = traceStr;
                 foreach (var x in tg)
                 {
                     if (x.M == m) continue;
@@ -372,6 +392,9 @@ namespace SPA_NS
         }
 
         // ------------------------------------------------------------ filas
+        Dictionary<string, string> curMarkerTrace = new Dictionary<string, string>();
+        Dictionary<string, Dictionary<string, string>> epMarkerTrace = new Dictionary<string, Dictionary<string, string>>();
+
         void BuildRows(Endpoint ep, List<RawItem> items, List<Marker> markers, HashSet<string> used)
         {
             var rows = new List<ResultRow>();
@@ -397,6 +420,14 @@ namespace SPA_NS
                         r.Loc = new Location(fr.File, fr.Line);
                     }
                     else if (fr.Origin == "sqlfile") r.Detail = "archivo .sql usado en " + fr.File.Rel + ":" + fr.Line;
+                    else if (fr.Kind == "bare" && (h.Loc.File != fr.File || h.Loc.Line < fr.Line || h.Loc.Line > fr.EndLine))
+                    {
+                        // nombre armado con constantes (Concat/Format/interpolacion): la ubicacion es el uso
+                        r.Loc = new Location(fr.File, fr.Line);
+                        r.Detail = fr.ConstRef != null
+                            ? "constante " + (fr.ConstRef.Owner != null ? fr.ConstRef.Owner.Name + "." : "") + fr.ConstRef.Name + " definida en " + fr.ConstRef.File.Rel + ":" + fr.ConstRef.Line
+                            : "nombre armado con constantes (" + h.Loc.Key + ")";
+                    }
                     else if (h.Loc.File != fr.File || fr.Pieces.Any(pc => pc.Const != null)) r.Detail = "usado en " + fr.File.Rel + ":" + fr.Line;
                     r.Form = FormText(fr);
                     AddLink(r, h.Sp); add(r);
@@ -450,7 +481,10 @@ namespace SPA_NS
                 if (used.Contains(mk.Id)) continue;
                 if (reported.Any(x => x.SameAs(mk.Sp))) continue;
                 if (!soloSeen.Add(mk.Sp.Key)) continue;
-                add(new ResultRow { Ep = ep, Sp = mk.Sp, Tipo = "SOLO_COMENTARIO", Loc = mk.Loc, Detail = MarkerDetail(mk), Trace = "" });
+                Dictionary<string, string> mt;
+                string mtr = "";
+                if (epMarkerTrace.TryGetValue(ep.Id, out mt)) mt.TryGetValue(mk.Id, out mtr);
+                add(new ResultRow { Ep = ep, Sp = mk.Sp, Tipo = "SOLO_COMENTARIO", Loc = mk.Loc, Detail = MarkerDetail(mk), Trace = mtr ?? "" });
             }
             Res.Rows.AddRange(rows);
             if (rows.Count == 0)
@@ -546,6 +580,9 @@ namespace SPA_NS
                     foreach (var h in Sm.FindInCode(scan.Blank, scan.Kind == "bare", scan.Kind == "bare" || scan.Kind == "pure"))
                         Res.Orphans.Add(new OrphanRef { Sp = h.Sp, Loc = new Location(mv.File, mv.Line), Context = td.Name + "." + mv.Name, Kind = "codigo", Detail = "constante no referenciada" });
                 }
+            // menciones en comentarios de SP que ya aparecen en algun endpoint (p.ej. el /// de una interfaz) no son huerfanas
+            var reportedKeys = new HashSet<string>(Res.Rows.SelectMany(r => new SpName[] { r.Sp, r.Child }).Where(x => x != null).Select(x => x.Key));
+            Res.Orphans = Res.Orphans.Where(o => o.Kind != "comentario" || !(reportedLocs.Contains(o.Loc.Key) || reportedKeys.Contains(o.Sp.Key))).ToList();
             Res.Orphans = Res.Orphans.Where(o => !reportedLocs.Contains(o.Loc.Key) || o.Kind == "comentario")
                 .GroupBy(o => o.Sp.Key + "|" + o.Loc.Key + "|" + o.Kind).Select(g => g.First()).ToList();
         }

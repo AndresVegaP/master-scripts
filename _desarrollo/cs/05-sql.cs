@@ -578,7 +578,7 @@ namespace SPA_NS
                     // var sb = new StringBuilder("SELECT ...")
                     int nk = open - 2;
                     while (nk > m.BodyStart && !(IsI(t, nk) && t[nk].Text == "new")) nk--;
-                    if (IsP(t, nk - 1, "=") && IsI(t, nk - 2)) fr.GroupVar = t[nk - 2].Text;
+                    if (IsP(t, nk - 1, "=") && IsI(t, nk - 2)) { fr.GroupVar = t[nk - 2].Text; fr.GroupStart = true; }
                 }
                 else if (BuilderCallee.IsMatch(callee) && recv != null && recv.Count >= 1 && !recv[0].IsCall && recv.All(s => !s.IsCall || BuilderCallee.IsMatch(s.Name)))
                 {
@@ -609,7 +609,10 @@ namespace SPA_NS
                 // cmd.CommandText = "PCK.SP";  sql += "...";  sql = "...";
                 if (tokStart >= 2 && IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 2) && t[tokStart - 2].Text == "CommandText" && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
                 if (tokStart >= 2 && (IsP(t, tokStart - 1, "+=") || (IsP(t, tokStart - 1, "=") && !IsI(t, tokStart - 3) && !IsP(t, tokStart - 3, ".")) || (IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 3) && (t[tokStart - 3].Text == "var" || t[tokStart - 3].Text == "string"))) && IsI(t, tokStart - 2))
+                {
                     fr.GroupVar = t[tokStart - 2].Text;
+                    fr.GroupStart = IsP(t, tokStart - 1, "=");   // "x = ..." o "var x = ...": valor nuevo; "x += ...": continuacion
+                }
                 else if (tokStart >= 4 && IsP(t, tokStart - 1, "+") && IsI(t, tokStart - 2) && IsP(t, tokStart - 3, "=") && IsI(t, tokStart - 4) && t[tokStart - 4].Text == t[tokStart - 2].Text)
                     fr.GroupVar = t[tokStart - 2].Text;
             }
@@ -701,15 +704,23 @@ namespace SPA_NS
         List<Fragment> MergeBuilders(MethodDecl m, List<Fragment> raw)
         {
             var result = new List<Fragment>();
-            var groups = new Dictionary<string, List<Fragment>>();
+            var open = new Dictionary<string, List<Fragment>>();
+            var closed = new List<KeyValuePair<string, List<Fragment>>>();
             foreach (var fr in raw.OrderBy(x => x.TokStart))
             {
                 if (fr.GroupVar == null) { result.Add(fr); continue; }
                 List<Fragment> l;
-                if (!groups.TryGetValue(fr.GroupVar, out l)) { l = new List<Fragment>(); groups[fr.GroupVar] = l; }
+                // una asignacion simple (sql = "...") reemplaza el valor: empieza un grupo nuevo
+                if (open.TryGetValue(fr.GroupVar, out l) && fr.GroupStart && l.Count > 0)
+                {
+                    closed.Add(new KeyValuePair<string, List<Fragment>>(fr.GroupVar, l));
+                    l = null;
+                }
+                if (l == null) { l = new List<Fragment>(); open[fr.GroupVar] = l; }
                 l.Add(fr);
             }
-            foreach (var kv in groups)
+            foreach (var kv in open) closed.Add(kv);
+            foreach (var kv in closed)
             {
                 var l = kv.Value;
                 if (l.Count == 1) { result.Add(l[0]); continue; }
@@ -855,6 +866,10 @@ namespace SPA_NS
                 int[] a0 = args[0];
                 foreach (var a in args) if (IsI(t, a[0]) && IsP(t, a[0] + 1, ":") && Regex.IsMatch(t[a[0]].Text, "^(sql|commandText|command)$", RegexOptions.IgnoreCase)) { a0 = new int[] { a[0] + 2, a[1] }; break; }
                 if (ma.Fragments.Any(fr => fr.TokStart < a0[1] && fr.TokEnd > a0[0])) continue;
+                // el texto viene de un metodo (ArmarSql(), sb.ToString(), helper.Get()): se sigue por el grafo de llamadas
+                bool hasCall = false;
+                for (int q = a0[0]; q < a0[1]; q++) if (IsP(t, q, "(")) { hasCall = true; break; }
+                if (hasCall) continue;
                 // CommandDefinition / variable con valor conocido / parametro de un wrapper: no se avisa
                 if (IsI(t, a0[0]) && t[a0[0]].Text == "new") continue;
                 // StringBuilder o variable acumulada: sb.ToString() / sql
@@ -872,6 +887,9 @@ namespace SPA_NS
                         int declTok = li.ExprTok;
                         int declEnd = declTok >= 0 ? ix.P(f).FindStmtEnd(declTok, m.BodyEnd) : -1;
                         if (declTok >= 0 && ma.Fragments.Any(fr => fr.TokStart >= declTok - 3 && fr.TokStart <= declEnd)) continue;
+                        bool initCall = false;
+                        for (int q = Math.Max(0, declTok); declTok >= 0 && q < declEnd; q++) if (IsP(t, q, "(")) { initCall = true; break; }
+                        if (initCall) continue;   // var sql = ArmarSql(): el texto sale de otro metodo
                         if (ma.Fragments.Any(fr => fr.GroupVar == n)) continue;
                     }
                     var mv = ix.ResolveMemberChain(new List<string> { n }, m.Owner);

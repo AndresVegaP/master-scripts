@@ -122,8 +122,9 @@ namespace SPA_NS
         {
             for (int i = 0; i < a.Positional.Count; i++)
             {
-                if (a.PositionalIsString[i]) return a.Positional[i];
+                // se evalua siempre (literal, interpolado con constantes $"{R.Version}/x" o concatenacion)
                 if (i < a.PosArgs.Count) { var v = ArgString(a.PosArgs[i], ctx); if (v != null) return v; }
+                if (a.PositionalIsString[i]) return a.Positional[i];
             }
             ArgRef nr;
             if (a.NamedArgs.TryGetValue("template", out nr)) return ArgString(nr, ctx);
@@ -251,9 +252,11 @@ namespace SPA_NS
                     foreach (var md in c.Methods)
                     {
                         if (md.IsCtor || md.IsStatic || !md.IsPublic || md.IsAbstract || !md.HasBody || md.IsSynthetic || md.IsLocalFunction) continue;
+                        if (md.AccessorKind != null || md.ExplicitIface != null || md.Name.StartsWith("op_") || md.Name.StartsWith("~")) continue;
                         if (Attr(md.Attrs, "NonAction") != null) continue;
                         if (md.Name == "Dispose" || md.Name == "ToString" || md.Name == "Equals" || md.Name == "GetHashCode") continue;
-                        string sig = md.Name + "/" + md.Params.Count;
+                        // firma con tipos: dos sobrecargas con la misma cantidad de parametros son acciones distintas
+                        string sig = md.Name + "(" + string.Join(",", md.Params.Select(p => p.Type != null ? p.Type.ToString() : "?").ToArray()) + ")";
                         if (!seen.Add(sig)) continue;
                         actions.Add(md);
                     }

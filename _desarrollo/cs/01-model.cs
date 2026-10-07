@@ -69,6 +69,9 @@ namespace SPA_NS
         public int[] Match;
         public List<Comment> Comments = new List<Comment>();
         public List<string> Usings = new List<string>();
+        public Dictionary<string, string> Aliases = new Dictionary<string, string>(StringComparer.Ordinal);   // using Alias = A.B.Tipo;
+        public List<string> GlobalUsings = new List<string>();
+        public Dictionary<string, string> GlobalAliases = new Dictionary<string, string>(StringComparer.Ordinal);
         public bool IsSql;
 
         public int LineOf(int offset)
@@ -171,6 +174,7 @@ namespace SPA_NS
         public List<Comment> Leading = new List<Comment>();
         public List<SourceFile> Files = new List<SourceFile>();
         public List<string> Usings = new List<string>();
+        public Dictionary<string, string> Aliases = new Dictionary<string, string>(StringComparer.Ordinal);
         public List<TypeRef> BaseCtorArgsOwner = new List<TypeRef>();
         public List<string> BaseCtorStrings = new List<string>();   // p.ej. CarterModule("/api/x")
         public TypeDecl MergedInto;
@@ -193,6 +197,8 @@ namespace SPA_NS
         public List<string> TypeParams = new List<string>();
         public MethodDecl Parent;                                   // metodo contenedor (funciones locales y lambdas)
         public List<MethodDecl> LocalFunctions = new List<MethodDecl>();
+        public string AccessorKind;                                 // get / set / init / add / remove (cuerpos de propiedades, indexadores y eventos)
+        public string ExplicitIface;                                // implementacion explicita: IFoo.Metodo
         public int BodyStart = -1, BodyEnd = -1;   // tokens [BodyStart, BodyEnd)
         public List<TokRange> Excluded = new List<TokRange>();
         public List<Comment> Leading = new List<Comment>();
@@ -292,12 +298,14 @@ namespace SPA_NS
         public string Form;              // forma de invocacion (para llamadas directas)
         public bool Ignored;             // el string no es un comando (comparacion, valor de parametro, respuesta HTTP)
         public string GroupVar;          // StringBuilder o variable acumulada a la que pertenece la pieza
+        public bool GroupStart;          // asignacion simple/declaracion: inicia un valor nuevo (no se concatena con el anterior)
         public bool GroupAppendLine;
 
         public Location LocOfValueOffset(int off)
         {
             FragPiece best = null;
-            foreach (var p in Pieces) { if (off >= p.ValueStart && off <= p.ValueStart + p.ValueLength) { best = p; break; } }
+            foreach (var p in Pieces) { if (off >= p.ValueStart && off < p.ValueStart + p.ValueLength) { best = p; break; } }
+            if (best == null) foreach (var p in Pieces) if (p.ValueStart <= off) best = p;
             if (best == null) return new Location(File, Line);
             int line = best.Line;
             if (best.CountsLines)

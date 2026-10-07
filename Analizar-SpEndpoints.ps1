@@ -88,6 +88,27 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# Con "powershell -File", una lista 'A','B' llega como un unico texto "A,B": se separa aqui.
+function Split-ListParam([string[]]$values) {
+    $r = New-Object System.Collections.Generic.List[string]
+    foreach ($v in @($values)) {
+        if ($null -eq $v) { continue }
+        foreach ($p in ($v -split ',')) {
+            $x = $p.Trim().Trim("'").Trim('"').Trim()
+            if ($x.Length -gt 0) { $r.Add($x) }
+        }
+    }
+    return [string[]]$r.ToArray()
+}
+$PackagePrefixes = Split-ListParam $PackagePrefixes
+$ObjectPrefixes = Split-ListParam $ObjectPrefixes
+$ExcludePath = Split-ListParam $ExcludePath
+foreach ($p in @($PackagePrefixes) + @($ObjectPrefixes)) {
+    if ($p -notmatch '^[A-Za-z][A-Za-z0-9_$#]*$') { throw "Prefijo no valido: '$p'. Use solo letras, numeros y '_' (por ejemplo PCK_ o SP_)." }
+}
+if (@($PackagePrefixes).Count -eq 0) { $PackagePrefixes = @('PCK_', 'PKG_') }
+if (@($ObjectPrefixes).Count -eq 0) { $ObjectPrefixes = @('SP_', 'FN_', 'PRC_') }
 $ScriptVersion = '1.0.0'
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -117,13 +138,17 @@ Write-Host "  Repositorio : $RepoPath"
 Write-Host "  Salida      : $OutputPath"
 
 # ---------------------------------------------------------------- descubrimiento de archivos
-$excludedDirNames = @('bin', 'obj', '.git', '.vs', '.vscode', '.idea', 'node_modules', 'packages', 'TestResults', 'artifacts',
-    '.github', '.gitlab', '.azuredevops', 'docs', 'doc', 'documentation', 'documentacion', "documentaci$([char]0x00F3)n", '.claude', '.config')
+$excludedDirNames = @('bin', 'obj', '.git', '.vs', '.vscode', '.idea', 'node_modules', 'TestResults', '.github', '.gitlab', '.azuredevops', '.claude', '.config')
+# solo se excluyen si estan en la raiz del repo (en otro nivel pueden ser modulos de codigo)
+$excludedRootNames = @('packages', 'artifacts')
+# carpetas de documentacion: se ignoran .sql/.resx/.json (analisis, scripts de BD) pero se leen los .cs (pueden ser modulos "Docs")
+$docDirNames = @('docs', 'doc', 'documentation', 'documentacion', "documentaci$([char]0x00F3)n")
 
 function Test-Excluded([string]$relPath) {
     foreach ($p in $ExcludePath) {
         if ([string]::IsNullOrWhiteSpace($p)) { continue }
-        $pp = $p.Replace('\', '/')
+        $pp = $p.Replace('\', '/').TrimEnd('/')
+        if ($pp.Length -eq 0) { continue }
         if ($relPath -like $pp -or $relPath -like "$pp/*" -or $relPath -like "*/$pp" -or $relPath -like "*/$pp/*") { return $true }
     }
     return $false
@@ -141,11 +166,13 @@ $configFiles = New-Object System.Collections.Generic.List[string]
 $csprojFiles = New-Object System.Collections.Generic.List[string]
 $skippedDirs = New-Object System.Collections.Generic.List[string]
 
-$stack = New-Object System.Collections.Generic.Stack[string]
+$stack = New-Object System.Collections.Generic.Stack[object]
 $visitedDirs = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-$stack.Push($RepoPath)
+$stack.Push(@($RepoPath, $false))
 while ($stack.Count -gt 0) {
-    $dir = $stack.Pop()
+    $item = $stack.Pop()
+    $dir = [string]$item[0]
+    $inDocs = [bool]$item[1]
     # OneDrive marca las carpetas como reparse points: no se saltan, pero se evita recorrer dos veces
     # la misma carpeta y los ciclos de enlaces con un limite de profundidad
     if (-not $visitedDirs.Add($dir)) { continue }
@@ -154,8 +181,9 @@ while ($stack.Count -gt 0) {
         foreach ($d in [System.IO.Directory]::EnumerateDirectories($dir)) {
             $name = [System.IO.Path]::GetFileName($d)
             $rel = Get-RelPath $d
-            if ($excludedDirNames -contains $name -or (Test-Excluded $rel)) { $skippedDirs.Add($rel); continue }
-            $stack.Push($d)
+            $atRoot = -not $rel.Contains('/')
+            if ($excludedDirNames -contains $name -or ($atRoot -and $excludedRootNames -contains $name) -or (Test-Excluded $rel)) { $skippedDirs.Add($rel); continue }
+            $stack.Push(@($d, ($inDocs -or ($docDirNames -contains $name))))
         }
         foreach ($f in [System.IO.Directory]::EnumerateFiles($dir)) {
             $rel = Get-RelPath $f
@@ -167,9 +195,9 @@ while ($stack.Count -gt 0) {
                     if ($fn -match '(?i)\.(g|g\.i|designer|generated|AssemblyInfo|AssemblyAttributes)\.cs$' -or $fn -match '(?i)^(AssemblyInfo|GlobalUsings\.g)\.cs$') { continue }
                     $csFiles.Add($f)
                 }
-                '.sql' { $sqlFiles.Add($f) }
-                '.resx' { $resxFiles.Add($f) }
-                '.json' { if ($fn -like 'appsettings*.json') { $configFiles.Add($f) } }
+                '.sql' { if (-not $inDocs) { $sqlFiles.Add($f) } }
+                '.resx' { if (-not $inDocs) { $resxFiles.Add($f) } }
+                '.json' { if (-not $inDocs -and $fn -like 'appsettings*.json') { $configFiles.Add($f) } }
                 '.csproj' { $csprojFiles.Add($f) }
             }
         }
@@ -285,6 +313,9 @@ namespace SPA_NS
         public int[] Match;
         public List<Comment> Comments = new List<Comment>();
         public List<string> Usings = new List<string>();
+        public Dictionary<string, string> Aliases = new Dictionary<string, string>(StringComparer.Ordinal);   // using Alias = A.B.Tipo;
+        public List<string> GlobalUsings = new List<string>();
+        public Dictionary<string, string> GlobalAliases = new Dictionary<string, string>(StringComparer.Ordinal);
         public bool IsSql;
 
         public int LineOf(int offset)
@@ -387,6 +418,7 @@ namespace SPA_NS
         public List<Comment> Leading = new List<Comment>();
         public List<SourceFile> Files = new List<SourceFile>();
         public List<string> Usings = new List<string>();
+        public Dictionary<string, string> Aliases = new Dictionary<string, string>(StringComparer.Ordinal);
         public List<TypeRef> BaseCtorArgsOwner = new List<TypeRef>();
         public List<string> BaseCtorStrings = new List<string>();   // p.ej. CarterModule("/api/x")
         public TypeDecl MergedInto;
@@ -409,6 +441,8 @@ namespace SPA_NS
         public List<string> TypeParams = new List<string>();
         public MethodDecl Parent;                                   // metodo contenedor (funciones locales y lambdas)
         public List<MethodDecl> LocalFunctions = new List<MethodDecl>();
+        public string AccessorKind;                                 // get / set / init / add / remove (cuerpos de propiedades, indexadores y eventos)
+        public string ExplicitIface;                                // implementacion explicita: IFoo.Metodo
         public int BodyStart = -1, BodyEnd = -1;   // tokens [BodyStart, BodyEnd)
         public List<TokRange> Excluded = new List<TokRange>();
         public List<Comment> Leading = new List<Comment>();
@@ -508,12 +542,14 @@ namespace SPA_NS
         public string Form;              // forma de invocacion (para llamadas directas)
         public bool Ignored;             // el string no es un comando (comparacion, valor de parametro, respuesta HTTP)
         public string GroupVar;          // StringBuilder o variable acumulada a la que pertenece la pieza
+        public bool GroupStart;          // asignacion simple/declaracion: inicia un valor nuevo (no se concatena con el anterior)
         public bool GroupAppendLine;
 
         public Location LocOfValueOffset(int off)
         {
             FragPiece best = null;
-            foreach (var p in Pieces) { if (off >= p.ValueStart && off <= p.ValueStart + p.ValueLength) { best = p; break; } }
+            foreach (var p in Pieces) { if (off >= p.ValueStart && off < p.ValueStart + p.ValueLength) { best = p; break; } }
+            if (best == null) foreach (var p in Pieces) if (p.ValueStart <= off) best = p;
             if (best == null) return new Location(File, Line);
             int line = best.Line;
             if (best.CountsLines)
@@ -598,6 +634,7 @@ namespace SPA_NS
         public Dictionary<string, List<string>> EndpointTraces = new Dictionary<string, List<string>>();
         public int FilesCs, FilesSql, Types, Methods;
         public List<string> ParseErrors = new List<string>();
+        public List<string> EncodingNotes = new List<string>();   // archivos leidos como Windows-1252
         public string ConventionalTemplate;
     }
 
@@ -750,8 +787,139 @@ namespace SPA_NS
                 toks.Add(new Token { Kind = TokKind.Punct, Start = i, End = i + p.Length, Text = p });
                 i += p.Length;
             }
-            foreach (var t in toks) { t.Line = f.LineOf(t.Start); t.EndLine = f.LineOf(Math.Max(t.Start, t.End - 1)); }
+            ApplyPreprocessor(f);
+            foreach (var t in f.Toks) { t.Line = f.LineOf(t.Start); t.EndLine = f.LineOf(Math.Max(t.Start, t.End - 1)); }
             ComputeMatch(f);
+        }
+
+        class PpBranch { public int Start, End; public bool? Cond; public bool IsElse; }
+
+        // #if/#elif/#else/#endif: descarta ramas estaticamente falsas y, si las ramas desconocidas
+        // desbalancean las llaves, conserva una sola (la del #else si existe) para no romper la estructura.
+        static void ApplyPreprocessor(SourceFile f)
+        {
+            var dirs = f.Comments.Where(c => c.IsPreproc).ToList();
+            if (!dirs.Any(d => Regex.IsMatch(d.Text, @"^\s*#\s*if\b"))) return;
+            var defined = new HashSet<string>(StringComparer.Ordinal);
+            var undefined = new HashSet<string>(StringComparer.Ordinal);
+            var stack = new List<List<PpBranch>>();
+            var drops = new List<int[]>();
+            foreach (var d in dirs)
+            {
+                var mm = Regex.Match(d.Text, @"^\s*#\s*(\w+)\s*(.*)$");
+                if (!mm.Success) continue;
+                string kw = mm.Groups[1].Value, rest = Regex.Replace(mm.Groups[2].Value, @"//.*$", "").Trim();
+                switch (kw)
+                {
+                    case "define": defined.Add(rest); undefined.Remove(rest); break;
+                    case "undef": undefined.Add(rest); defined.Remove(rest); break;
+                    case "if":
+                        stack.Add(new List<PpBranch> { new PpBranch { Start = d.End, End = -1, Cond = EvalPp(rest, defined, undefined) } });
+                        break;
+                    case "elif":
+                    case "else":
+                        if (stack.Count == 0) break;
+                        var g = stack[stack.Count - 1];
+                        g[g.Count - 1].End = d.Start;
+                        g.Add(new PpBranch { Start = d.End, End = -1, Cond = kw == "elif" ? EvalPp(rest, defined, undefined) : null, IsElse = kw == "else" });
+                        break;
+                    case "endif":
+                        if (stack.Count == 0) break;
+                        var grp = stack[stack.Count - 1];
+                        stack.RemoveAt(stack.Count - 1);
+                        grp[grp.Count - 1].End = d.Start;
+                        DecideGroup(f, grp, drops);
+                        break;
+                }
+            }
+            if (drops.Count == 0) return;
+            Func<int, bool> dropped = off => drops.Any(r => off >= r[0] && off < r[1]);
+            f.Toks = f.Toks.Where(t => !dropped(t.Start)).ToList();
+            f.Comments = f.Comments.Where(c => c.IsPreproc || !dropped(c.Start)).ToList();
+        }
+
+        static void DecideGroup(SourceFile f, List<PpBranch> grp, List<int[]> drops)
+        {
+            var keep = new List<PpBranch>();
+            bool priorTrue = false, allPriorFalse = true;
+            foreach (var b in grp)
+            {
+                bool? c = b.IsElse ? (priorTrue ? (bool?)false : (allPriorFalse ? (bool?)true : null)) : b.Cond;
+                if (priorTrue) c = false;
+                if (c == true) { priorTrue = true; keep.Clear(); keep.Add(b); continue; }
+                if (c == null) { allPriorFalse = false; keep.Add(b); }
+            }
+            if (!priorTrue && keep.Count > 1)
+            {
+                // ramas desconocidas: si alguna desbalancea las llaves, se conserva una sola
+                bool unbalanced = keep.Any(b => BraceDelta(f, b) != 0);
+                if (unbalanced)
+                {
+                    var one = keep.FirstOrDefault(b => b.IsElse) ?? keep[0];
+                    keep = new List<PpBranch> { one };
+                }
+            }
+            foreach (var b in grp) if (!keep.Contains(b) && b.End > b.Start) drops.Add(new int[] { b.Start, b.End });
+        }
+
+        static int BraceDelta(SourceFile f, PpBranch b)
+        {
+            int d = 0;
+            foreach (var t in f.Toks)
+            {
+                if (t.Start < b.Start) continue;
+                if (t.Start >= b.End) break;
+                if (t.Kind == TokKind.Punct) { if (t.Text == "{") d++; else if (t.Text == "}") d--; }
+            }
+            return d;
+        }
+
+        // evaluacion de tres estados: true / false / null (desconocido)
+        static bool? EvalPp(string expr, HashSet<string> defined, HashSet<string> undefined)
+        {
+            var toks = Regex.Matches(expr, @"\w+|&&|\|\||==|!=|!|\(|\)").Cast<Match>().Select(x => x.Value).ToList();
+            int pos = 0;
+            return PpOr(toks, ref pos, defined, undefined);
+        }
+
+        static bool? PpOr(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            var l = PpAnd(t, ref p, d, u);
+            while (p < t.Count && t[p] == "||") { p++; var r = PpAnd(t, ref p, d, u); l = (l == true || r == true) ? true : (l == false && r == false) ? (bool?)false : null; }
+            return l;
+        }
+
+        static bool? PpAnd(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            var l = PpEq(t, ref p, d, u);
+            while (p < t.Count && t[p] == "&&") { p++; var r = PpEq(t, ref p, d, u); l = (l == false || r == false) ? false : (l == true && r == true) ? (bool?)true : null; }
+            return l;
+        }
+
+        static bool? PpEq(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            var l = PpUnary(t, ref p, d, u);
+            while (p < t.Count && (t[p] == "==" || t[p] == "!="))
+            {
+                bool eq = t[p] == "=="; p++;
+                var r = PpUnary(t, ref p, d, u);
+                l = (l == null || r == null) ? null : (bool?)(eq ? l == r : l != r);
+            }
+            return l;
+        }
+
+        static bool? PpUnary(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            if (p >= t.Count) return null;
+            string x = t[p];
+            if (x == "!") { p++; var v = PpUnary(t, ref p, d, u); return v == null ? null : (bool?)!v.Value; }
+            if (x == "(") { p++; var v = PpOr(t, ref p, d, u); if (p < t.Count && t[p] == ")") p++; return v; }
+            p++;
+            if (x == "true" || x == "1") return true;
+            if (x == "false" || x == "0") return false;
+            if (d.Contains(x)) return true;
+            if (u.Contains(x)) return false;
+            return null;
         }
 
         static void AddComment(SourceFile f, int s, int e, bool doc, bool pre)
@@ -771,7 +939,13 @@ namespace SPA_NS
         }
 
         public static bool IsIdStart(char c) { return char.IsLetter(c) || c == '_'; }
-        public static bool IsIdPart(char c) { return char.IsLetterOrDigit(c) || c == '_'; }
+        public static bool IsIdPart(char c)
+        {
+            if (char.IsLetterOrDigit(c) || c == '_') return true;
+            var uc = char.GetUnicodeCategory(c);
+            return uc == System.Globalization.UnicodeCategory.NonSpacingMark || uc == System.Globalization.UnicodeCategory.SpacingCombiningMark
+                || uc == System.Globalization.UnicodeCategory.ConnectorPunctuation || uc == System.Globalization.UnicodeCategory.Format;
+        }
 
         // Devuelve null si no es un string. 'end' = indice despues del string.
         public static StrLit LexString(string s, int i, out int end)
@@ -923,6 +1097,9 @@ namespace SPA_NS
                     var l = LexString(s, k, out e);
                     if (l != null && e > k) { k = e; continue; }
                 }
+                // comentarios dentro del hueco: un apostrofo en "/* don't */" no es un literal char
+                if (c == '/' && k + 1 < n && s[k + 1] == '/') { int e = s.IndexOf('\n', k); k = e < 0 ? n : e; continue; }
+                if (c == '/' && k + 1 < n && s[k + 1] == '*') { int e = s.IndexOf("*/", k + 2, StringComparison.Ordinal); k = e < 0 ? n : e + 2; continue; }
                 if (c == '\'')
                 {
                     int j = k + 1;
@@ -1062,7 +1239,7 @@ namespace SPA_NS
                         if (!IsP(k, "(") && !IsId(k, "var") && !(IsIdent(k) && IsIdent(k + 1) && IsP(k + 2, "=")))
                         {
                             int semi = FindStmtEnd(k, e);
-                            RecordUsing(k, semi);
+                            RecordUsing(k, semi, x == "global");
                             i = semi + 1; continue;
                         }
                     }
@@ -1132,19 +1309,37 @@ namespace SPA_NS
             return IsTypeDeclAt(k) || IsId(k, "delegate");
         }
 
-        void RecordUsing(int k, int semi)
+        void RecordUsing(int k, int semi, bool isGlobal)
         {
             bool isStatic = false;
             if (IsId(k, "static")) { isStatic = true; k++; }
+            // alias: using Repo = A.B.ClientesRepository;  using IRepo = A.IGenerico<A.Cliente>;
+            if (IsIdent(k) && IsP(k + 1, "="))
+            {
+                string alias = t[k].Text;
+                var ab = new StringBuilder();
+                for (int j = k + 2; j < semi; j++) { if (IsP(j, "<")) break; ab.Append(t[j].Text); }
+                string target = ab.ToString().Replace("global::", "");
+                if (target.Length > 0)
+                {
+                    f.Aliases[alias] = target;
+                    if (isGlobal) f.GlobalAliases[alias] = target;
+                }
+                return;
+            }
             var sb = new StringBuilder();
             for (int j = k; j < semi; j++)
             {
-                if (IsP(j, "=")) return; // alias
                 if (IsP(j, "<")) break;
                 sb.Append(t[j].Text);
             }
             string u = sb.ToString().Replace("global::", "");
-            if (u.Length > 0) f.Usings.Add(isStatic ? "static:" + u : u);
+            if (u.Length > 0)
+            {
+                string val = isStatic ? "static:" + u : u;
+                f.Usings.Add(val);
+                if (isGlobal) f.GlobalUsings.Add(val);
+            }
         }
 
         int HandleTopLevel(int i, int e)
@@ -1182,6 +1377,7 @@ namespace SPA_NS
                 topProgram = new TypeDecl { Name = "Program", Namespace = "", FullName = "Program", Kind = "class", File = f, Line = t[i].Line, IsPartial = true };
                 topProgram.Files.Add(f);
                 topProgram.Usings = f.Usings;
+                topProgram.Aliases = f.Aliases;
                 topProgram.Id = "T" + (++seq);
                 Types.Add(topProgram);
             }
@@ -1212,6 +1408,7 @@ namespace SPA_NS
             td.FullName = (outer != null ? outer.FullName + "." : (ns.Length > 0 ? ns + "." : "")) + td.Name;
             td.Leading = CommentsBefore(declStart, k);
             td.Usings = f.Usings;
+            td.Aliases = f.Aliases;
             td.Files.Add(f);
             k++;
             if (IsP(k, "<")) { int g = SkipGeneric(k); if (g > 0) { td.TypeParams = GenericParamNames(k, g); k = g + 1; } }
@@ -1257,7 +1454,19 @@ namespace SPA_NS
         {
             int k = i;
             var x = t[k];
-            if (IsP(k, "~")) return SkipUnknown(i, e);
+            // finalizador: ~Nombre() { }
+            if (IsP(k, "~"))
+            {
+                if (IsIdent(k + 1) && IsP(k + 2, "(") && M(k + 2) > 0)
+                {
+                    var fm = NewMethod("~" + t[k + 1].Text, td, k + 1, declStart, attrs, mods);
+                    int fk = M(k + 2) + 1;
+                    ParseBody(ref fk, fm);
+                    Register(fm, td);
+                    return Math.Max(fk, i + 1);
+                }
+                return SkipUnknown(i, e);
+            }
             if (x.Kind == TokKind.Ident && x.Text == td.Name && IsP(k + 1, "("))
             {
                 int c = M(k + 1);
@@ -1283,17 +1492,69 @@ namespace SPA_NS
                 Register(md, td);
                 return k;
             }
-            if (x.Kind == TokKind.Ident && (x.Text == "event" || x.Text == "implicit" || x.Text == "explicit" || x.Text == "delegate"))
+            // C# 14: extension(Tipo receptor) { miembros }
+            if (x.Kind == TokKind.Ident && x.Text == "extension" && IsP(k + 1, "(") && M(k + 1) > 0 && IsP(M(k + 1) + 1, "{"))
+            {
+                int pc = M(k + 1);
+                var recv = ParseParams(k + 1, pc);
+                int open = pc + 1, close = M(open);
+                if (close < 0) return SkipUnknown(i, e);
+                int before = td.Methods.Count;
+                ParseScope(open + 1, close, td.Namespace, td, false);
+                if (recv.Count > 0)
+                {
+                    var rp = recv[0]; rp.IsThis = true;
+                    for (int q = before; q < td.Methods.Count; q++)
+                    {
+                        var em = td.Methods[q];
+                        if (em.Params.Count == 0 || !em.Params[0].IsThis) em.Params.Insert(0, rp);
+                        em.IsExtension = true; em.IsStatic = true;
+                    }
+                }
+                return close + 1;
+            }
+            if (x.Kind == TokKind.Ident && x.Text == "delegate") return SkipUnknown(i, e);
+            // evento con accesores: event Tipo Nombre { add { } remove { } }
+            if (x.Kind == TokKind.Ident && x.Text == "event")
+            {
+                int ek = k + 1;
+                var et = ParseTypeRef(ref ek);
+                if (et != null && IsIdent(ek) && IsP(ek + 1, "{") && M(ek + 1) > 0)
+                {
+                    ParseAccessors(t[ek].Text, ek, ek + 1, td, declStart, attrs, mods, null);
+                    return M(ek + 1) + 1;
+                }
                 return SkipUnknown(i, e);
+            }
+            // operadores de conversion: implicit/explicit operator T(...)
+            if (x.Kind == TokKind.Ident && (x.Text == "implicit" || x.Text == "explicit"))
+                return ParseOperator(i, e, k, declStart, attrs, mods, td);
             if (x.Kind != TokKind.Ident && !IsP(k, "(")) return SkipUnknown(i, e);
 
             TypeRef type = ParseTypeRef(ref k);
             if (type == null) return SkipUnknown(i, e);
-            if (IsId(k, "operator")) return SkipUnknown(i, e);
-            if (IsId(k, "this") && IsP(k + 1, "[")) return SkipUnknown(i, e);
+            if (IsId(k, "operator")) return ParseOperator(i, e, k, declStart, attrs, mods, td);
+            // indexador: Tipo this[...] { get { } set { } }  /  => expr;
+            if (IsId(k, "this") && IsP(k + 1, "[") && M(k + 1) > 0)
+            {
+                int bc = M(k + 1);
+                var ip = ParseParams(k + 1, bc);
+                int ik = bc + 1;
+                if (IsP(ik, "{") && M(ik) > 0) { ParseAccessors("this[]", k, ik, td, declStart, attrs, mods, ip); return M(ik) + 1; }
+                if (IsP(ik, "=>"))
+                {
+                    var gm = NewMethod("this[]", td, k, declStart, attrs, mods);
+                    gm.AccessorKind = "get"; gm.Params = ip; gm.ReturnType = type;
+                    ParseBody(ref ik, gm);
+                    Register(gm, td);
+                    return ik;
+                }
+                return SkipUnknown(i, e);
+            }
             if (!IsIdent(k)) return SkipUnknown(i, e);
             string name = t[k].Text;
             int nameTok = k;
+            string explicitIface = null;
             k++;
             int guard = 0;
             while (guard++ < 20)
@@ -1301,10 +1562,10 @@ namespace SPA_NS
                 if (IsP(k, "<"))
                 {
                     int g = SkipGeneric(k);
-                    if (g > 0 && IsP(g + 1, ".") && IsIdent(g + 2)) { name = t[g + 2].Text; nameTok = g + 2; k = g + 3; continue; }
+                    if (g > 0 && IsP(g + 1, ".") && IsIdent(g + 2)) { explicitIface = name; name = t[g + 2].Text; nameTok = g + 2; k = g + 3; continue; }
                     break;
                 }
-                if (IsP(k, ".") && IsIdent(k + 1)) { name = t[k + 1].Text; nameTok = k + 1; k += 2; continue; }
+                if (IsP(k, ".") && IsIdent(k + 1)) { explicitIface = name; name = t[k + 1].Text; nameTok = k + 1; k += 2; continue; }
                 break;
             }
             List<string> mtp = null;
@@ -1315,6 +1576,7 @@ namespace SPA_NS
                 if (c < 0) return SkipUnknown(i, e);
                 var md = NewMethod(name, td, nameTok, declStart, attrs, mods);
                 md.ReturnType = type;
+                md.ExplicitIface = explicitIface;
                 if (mtp != null) md.TypeParams = mtp;
                 md.Params = ParseParams(k, c);
                 md.IsExtension = md.Params.Count > 0 && md.Params[0].IsThis;
@@ -1345,6 +1607,8 @@ namespace SPA_NS
                         break;
                     }
                 }
+                // cuerpos de los accesores como metodos (para seguir llamadas y SP dentro de get/set)
+                ParseAccessors(name, nameTok, k, td, declStart, attrs, mods, null, type, explicitIface);
                 k = c + 1;
                 if (IsP(k, "="))
                 {
@@ -1362,6 +1626,11 @@ namespace SPA_NS
                 int end = FindStmtEnd(k + 1, t.Count);
                 mv.InitStart = k + 1; mv.InitEnd = end;
                 AddVar(td, mv);
+                // propiedad de solo lectura con cuerpo de expresion: accesor get
+                var gm = NewMethod(name, td, nameTok, declStart, attrs, mods);
+                gm.AccessorKind = "get"; gm.ReturnType = type; gm.ExplicitIface = explicitIface;
+                gm.BodyStart = k + 1; gm.BodyEnd = end;
+                Register(gm, td);
                 return end + 1;
             }
             if (IsP(k, "=") || IsP(k, ";") || IsP(k, ","))
@@ -1384,6 +1653,55 @@ namespace SPA_NS
                 return k;
             }
             return SkipUnknown(i, e);
+        }
+
+        void ParseAccessors(string name, int nameTok, int open, TypeDecl td, int declStart, List<AttrInfo> attrs, HashSet<string> mods, List<ParamInfo> idxParams)
+        {
+            ParseAccessors(name, nameTok, open, td, declStart, attrs, mods, idxParams, null, null);
+        }
+
+        // { [attr] [mod] get => x; set { ... } init; add {...} remove {...} }
+        void ParseAccessors(string name, int nameTok, int open, TypeDecl td, int declStart, List<AttrInfo> attrs, HashSet<string> mods, List<ParamInfo> idxParams, TypeRef type, string explicitIface)
+        {
+            int close = M(open);
+            if (close < 0) return;
+            int j = open + 1;
+            int guard = 0;
+            while (j < close && guard++ < 50)
+            {
+                while (IsP(j, "[") && M(j) > j && M(j) < close) j = M(j) + 1;
+                while (IsIdent(j) && (t[j].Text == "private" || t[j].Text == "protected" || t[j].Text == "internal" || t[j].Text == "public" || t[j].Text == "readonly")) j++;
+                if (!IsIdent(j)) { j++; continue; }
+                string kw = t[j].Text;
+                if (kw != "get" && kw != "set" && kw != "init" && kw != "add" && kw != "remove") { j++; continue; }
+                int b = j + 1;
+                if (IsP(b, ";")) { j = b + 1; continue; }   // accesor automatico
+                var am = NewMethod(name, td, nameTok, declStart, attrs, mods);
+                am.AccessorKind = kw == "init" ? "set" : kw;
+                am.ReturnType = type;
+                am.ExplicitIface = explicitIface;
+                if (idxParams != null) am.Params = new List<ParamInfo>(idxParams);
+                if (kw != "get") am.Params.Add(new ParamInfo { Name = "value" });
+                ParseBody(ref b, am);
+                if (am.HasBody) Register(am, td);
+                j = Math.Max(b, j + 1);
+            }
+        }
+
+        // operadores: Tipo operator +(...) { }  /  implicit operator T(...) => ...
+        int ParseOperator(int i, int e, int k, int declStart, List<AttrInfo> attrs, HashSet<string> mods, TypeDecl td)
+        {
+            int j = k;
+            while (j < e && !IsP(j, "(")) j++;
+            if (j >= e || M(j) < 0) return SkipUnknown(i, e);
+            var sb = new StringBuilder("op_");
+            for (int q = k + 1; q < j; q++) sb.Append(t[q].Text);
+            var om = NewMethod(sb.ToString(), td, k, declStart, attrs, mods);
+            om.Params = ParseParams(j, M(j));
+            int b = M(j) + 1;
+            ParseBody(ref b, om);
+            if (om.HasBody) Register(om, td);
+            return Math.Max(b, i + 1);
         }
 
         MethodDecl NewMethod(string name, TypeDecl td, int nameTok, int declStart, List<AttrInfo> attrs, HashSet<string> mods)
@@ -1757,6 +2075,7 @@ namespace SPA_NS
         public bool IsNew, IsMethodGroup;
         public TypeRef NewType;
         public int ArgOpen = -1;
+        public string PropertyAccess;     // get / set: acceso a propiedad o indexador con cuerpo
     }
 
     // destino de una llamada: metodo y tipo concreto a traves del cual se llega (para despacho virtual)
@@ -1817,6 +2136,7 @@ namespace SPA_NS
         public Dictionary<SourceFile, Parser> Parsers = new Dictionary<SourceFile, Parser>();
         public Dictionary<string, List<TypeDecl>> NestedByOuter = new Dictionary<string, List<TypeDecl>>();
         public HashSet<string> ReferencedConsts = new HashSet<string>();
+        public HashSet<string> PropertyNames = new HashSet<string>(StringComparer.Ordinal);   // propiedades/indexadores con cuerpo
         public bool TrackRefs;
         Dictionary<string, Dictionary<string, LocalInfo>> localsCache = new Dictionary<string, Dictionary<string, LocalInfo>>();
         Dictionary<string, List<CallSite>> callsCache = new Dictionary<string, List<CallSite>>();
@@ -1898,6 +2218,7 @@ namespace SPA_NS
             }
             // funciones locales (incluidas las de Program.cs con top-level statements)
             foreach (var md in Methods.ToList()) if (md.HasBody) FindLocalFunctions(md);
+            foreach (var md in Methods) if (md.AccessorKind != null) PropertyNames.Add(md.Name);
             // ancestros e implementadores
             foreach (var td in Types)
             {
@@ -2192,6 +2513,13 @@ namespace SPA_NS
         public List<TypeDecl> ResolveTypeName(string name, TypeDecl ctx)
         {
             List<TypeDecl> c;
+            // alias: using Repo = A.B.ClientesRepository;
+            string aliasTarget;
+            if (name != null && ctx != null && ctx.Aliases != null && ctx.Aliases.TryGetValue(name, out aliasTarget))
+            {
+                var aq = ResolveQualifiedNoAlias(aliasTarget.Split('.').ToList());
+                if (aq.Count > 0) return aq;
+            }
             if (name == null || !TypesByName.TryGetValue(name, out c)) return new List<TypeDecl>();
             if (c.Count == 1 || ctx == null) return c;
             ctx = ctx.MergedInto ?? ctx;
@@ -2232,6 +2560,15 @@ namespace SPA_NS
         {
             if (names.Count == 0) return new List<TypeDecl>();
             if (names.Count == 1) return ResolveTypeName(names[0], ctx);
+            string aliasTarget;
+            if (ctx != null && ctx.Aliases != null && ctx.Aliases.TryGetValue(names[0], out aliasTarget))
+                names = aliasTarget.Split('.').Concat(names.Skip(1)).ToList();
+            return ResolveQualifiedNoAlias(names);
+        }
+
+        List<TypeDecl> ResolveQualifiedNoAlias(List<string> names)
+        {
+            if (names.Count == 0) return new List<TypeDecl>();
             string qual = string.Join(".", names.ToArray());
             List<TypeDecl> all;
             if (TypesByName.TryGetValue(names[names.Count - 1], out all))
@@ -2310,27 +2647,58 @@ namespace SPA_NS
             r.Add(new Target { M = m, Via = via, Inferred = inferred });
         }
 
+        // bases de un tipo con los argumentos genericos sustituidos a lo largo de la jerarquia:
+        // ClientesRepository : Repository<Cliente>, Repository<T> : IRepository<T>  =>  IRepository<Cliente>
+        Dictionary<string, List<TypeRef>> substBaseCache = new Dictionary<string, List<TypeRef>>();
+        public List<TypeRef> SubstitutedBaseRefs(TypeDecl td)
+        {
+            List<TypeRef> r;
+            if (substBaseCache.TryGetValue(td.Id, out r)) return r;
+            r = new List<TypeRef>();
+            substBaseCache[td.Id] = r;
+            var queue = new Queue<KeyValuePair<KeyValuePair<TypeRef, TypeDecl>, Dictionary<string, TypeRef>>>();
+            foreach (var b in td.Bases) queue.Enqueue(new KeyValuePair<KeyValuePair<TypeRef, TypeDecl>, Dictionary<string, TypeRef>>(new KeyValuePair<TypeRef, TypeDecl>(b, td), new Dictionary<string, TypeRef>()));
+            var seen = new HashSet<string>();
+            int guard = 0;
+            while (queue.Count > 0 && guard++ < 300)
+            {
+                var it = queue.Dequeue();
+                var b = Subst(it.Key.Key, it.Value);
+                r.Add(b);
+                foreach (var bd in ResolveTypeRef(b, it.Key.Value))
+                {
+                    if (!seen.Add(bd.Id + "|" + b.ToString())) continue;
+                    var map = new Dictionary<string, TypeRef>();
+                    for (int i = 0; i < bd.TypeParams.Count && i < b.Args.Count; i++) map[bd.TypeParams[i]] = b.Args[i];
+                    foreach (var bb in bd.Bases) queue.Enqueue(new KeyValuePair<KeyValuePair<TypeRef, TypeDecl>, Dictionary<string, TypeRef>>(new KeyValuePair<TypeRef, TypeDecl>(bb, bd), map));
+                }
+            }
+            return r;
+        }
+
         // true si el implementador "it" es compatible con los argumentos genericos cerrados del receptor (IRepository<Producto>)
         bool GenericCompatible(TypeDecl it, TypeDecl recvType, List<TypeRef> recvRefs)
         {
             if (recvRefs == null) return true;
             var rr = recvRefs.FirstOrDefault(x => x.Name == recvType.Name && x.Args.Count > 0);
             if (rr == null) return true;
-            foreach (var b in AllBaseRefs(it))
+            bool any = false;
+            foreach (var b in SubstitutedBaseRefs(it))
             {
                 if (b.Name != recvType.Name || b.Args.Count != rr.Args.Count) continue;
+                any = true;
                 bool ok = true;
                 for (int i = 0; i < b.Args.Count; i++)
                 {
                     string ba = b.Args[i].Name, ra = rr.Args[i].Name;
                     if (ba == ra) continue;
-                    // parametro generico del implementador (Repository<T>) o de alguna base intermedia
-                    if (it.TypeParams.Contains(ba) || (ba.Length <= 2 && char.IsUpper(ba[0])) || ba.StartsWith("T") && !TypesByName.ContainsKey(ba)) continue;
+                    // parametro generico propio del implementador (Repository<T> sin cerrar)
+                    if (it.TypeParams.Contains(ba)) continue;
                     ok = false; break;
                 }
                 if (ok) return true;
             }
-            return false;
+            return !any;
         }
 
         public List<Target> FindMethods(List<TypeDecl> types, string name, int argc, List<TypeRef> recvRefs, bool noPoly)
@@ -2339,6 +2707,8 @@ namespace SPA_NS
             foreach (var td in types)
             {
                 var direct = MethodsNamed(td, name, true);
+                // las implementaciones explicitas (IFoo.Metodo) solo son accesibles a traves de la interfaz
+                if (td.Kind != "interface") direct = direct.Where(x => x.ExplicitIface == null).ToList();
                 foreach (var md in direct) AddT(r, md, td, false);
                 if (noPoly) continue;
                 bool poly = td.Kind == "interface" || td.IsAbstract || direct.Any(x => x.IsAbstract || x.IsVirtual || !x.HasBody);
@@ -2350,7 +2720,14 @@ namespace SPA_NS
                 foreach (var it in concrete)
                 {
                     if (!GenericCompatible(it, td, recvRefs)) continue;
-                    foreach (var md in MethodsNamed(it, name, true)) AddT(r, md, it, false);
+                    var ms = MethodsNamed(it, name, true);
+                    bool hasExplicit = td.Kind == "interface" && ms.Any(x => x.ExplicitIface == td.Name);
+                    foreach (var md in ms)
+                    {
+                        if (md.ExplicitIface != null && md.ExplicitIface != td.Name) continue;
+                        if (hasExplicit && md.ExplicitIface == null && md.Owner == it) continue;   // la explicita gana via esa interfaz
+                        AddT(r, md, it, false);
+                    }
                 }
             }
             return FilterArgcT(r, argc, false);
@@ -2705,7 +3082,11 @@ namespace SPA_NS
                     int j = k + 1;
                     if (IsP(t, j, "(") || IsP(t, j, "[") || IsP(t, j, "{")) continue;
                     var tr = p.ParseTypeRef(ref j);
-                    if (tr != null) r.Add(new CallSite { IsNew = true, NewType = tr, Name = tr.Name, Tok = k, Line = tk.Line });
+                    if (tr != null)
+                    {
+                        r.Add(new CallSite { IsNew = true, NewType = tr, Name = tr.Name, Tok = k, Line = tk.Line });
+                        k = j - 1;   // new A.B.Query(...): el nombre del tipo no es una llamada
+                    }
                     continue;
                 }
                 if (U.IsKeyword(tk.Text) && tk.Text != "this" && tk.Text != "base") continue;
@@ -2715,13 +3096,34 @@ namespace SPA_NS
                 bool afterDot = IsP(t, k - 1, ".") || IsP(t, k - 1, "?.");
                 if (IsP(t, a, "(") && mt[a] > a)
                 {
-                    // descartar declaraciones de funciones locales: "Tipo Nombre(" con tipo previo
+                    // descartar declaraciones de funciones locales: "Tipo Nombre(" con tipo previo, o seguidas de { / => / where
                     if (!afterDot && k > m.BodyStart && IsI(t, k - 1) && !U.IsKeyword(t[k - 1].Text) && IsDeclContext(t, k - 1)) continue;
+                    int after = mt[a] + 1;
+                    if (!afterDot && (IsP(t, after, "{") || IsP(t, after, "=>") || (IsI(t, after) && t[after].Text == "where"))) continue;
                     if (tk.Text == "this" || tk.Text == "base") continue;
                     var cs = new CallSite { Name = tk.Text, Tok = k, Line = tk.Line, ArgOpen = a, Argc = CountArgs(f, a) };
                     if (afterDot) { int st; cs.Receiver = WalkBack(f, k - 1, out st); }
                     r.Add(cs);
                     continue;
+                }
+                // acceso a propiedad o indexador con cuerpo: _repo.Total / _repo.Limite = v / _repo[id]
+                if (PropertyNames.Count > 0)
+                {
+                    int st;
+                    bool isIdx = IsP(t, k + 1, "[") && mt[k + 1] > k && PropertyNames.Contains("this[]") && !U.IsKeyword(tk.Text);
+                    if (isIdx)
+                    {
+                        var recvI = afterDot ? WalkBack(f, k - 1, out st) : new List<Seg>();
+                        recvI.Add(new Seg { Name = tk.Text });
+                        r.Add(new CallSite { Name = "this[]", Receiver = recvI, Argc = -2, Tok = k, Line = tk.Line, PropertyAccess = IsAssign(t, mt[k + 1] + 1) ? "set" : "get" });
+                    }
+                    bool initProp = !afterDot && (IsP(t, k - 1, "{") || IsP(t, k - 1, ",")) && IsAssign(t, k + 1);
+                    if (PropertyNames.Contains(tk.Text) && !initProp && (afterDot || (!Locals(m).ContainsKey(tk.Text) && !m.Params.Any(pp => pp.Name == tk.Text))))
+                    {
+                        var recvP = afterDot ? WalkBack(f, k - 1, out st) : new List<Seg>();
+                        r.Add(new CallSite { Name = tk.Text, Receiver = recvP, Argc = -2, Tok = k, Line = tk.Line, PropertyAccess = (!isIdx && IsAssign(t, k + 1)) ? "set" : "get" });
+                        continue;
+                    }
                 }
                 // grupo de metodos pasado como delegado: (X) , X ,  obj.X , Tipo.X
                 if ((IsP(t, k + 1, ",") || IsP(t, k + 1, ")")) && !U.IsKeyword(tk.Text)
@@ -2735,6 +3137,13 @@ namespace SPA_NS
                 }
             }
             return r;
+        }
+
+        static bool IsAssign(List<Token> t, int i)
+        {
+            if (i < 0 || i >= t.Count || t[i].Kind != TokKind.Punct) return false;
+            string x = t[i].Text;
+            return x == "=" || x == "+=" || x == "-=" || x == "*=" || x == "/=" || x == "%=" || x == "&=" || x == "|=" || x == "^=" || x == "??=";
         }
 
         static bool IsDeclContext(List<Token> t, int typeTok)
@@ -2839,6 +3248,13 @@ namespace SPA_NS
         // Resuelve una llamada a metodos del repo. thisType = tipo concreto del objeto actual (despacho virtual).
         public List<Target> ResolveTargets(MethodDecl m, CallSite cs, TypeDecl thisType, out bool inferred, out bool unresolvedRepoName)
         {
+            var r = ResolveTargetsCore(m, cs, thisType, out inferred, out unresolvedRepoName);
+            if (cs.PropertyAccess != null) return r.Where(x => x.M.AccessorKind == cs.PropertyAccess).ToList();
+            return r.Where(x => x.M.AccessorKind == null).ToList();
+        }
+
+        List<Target> ResolveTargetsCore(MethodDecl m, CallSite cs, TypeDecl thisType, out bool inferred, out bool unresolvedRepoName)
+        {
             inferred = false; unresolvedRepoName = false;
             var r = new List<Target>();
             if (cs.IsNew) return r;
@@ -2927,9 +3343,11 @@ namespace SPA_NS
             if (recv.Known)
             {
                 // coleccion externa indexada (diccionario de estrategias): avisar si el nombre existe en el repo
-                if (cs.Receiver.Any(x => x.IsIndexer) && MethodsByName.ContainsKey(cs.Name)) unresolvedRepoName = true;
+                if (cs.Receiver.Any(x => x.IsIndexer) && MethodsByName.ContainsKey(cs.Name) && cs.PropertyAccess == null) unresolvedRepoName = true;
                 return r;
             }
+            // acceso a propiedad con receptor desconocido: no se resuelve por nombre (evita falsos positivos)
+            if (cs.PropertyAccess != null) return r;
             // pista por nombre del receptor: _ventasRepository -> VentasRepository / IVentasRepository
             string hint = cs.Receiver[cs.Receiver.Count - 1].Name.TrimStart('_');
             if (hint.StartsWith("m_") || hint.StartsWith("s_")) hint = hint.Substring(2);
@@ -3161,7 +3579,7 @@ namespace SPA_NS
             int k = s;
             bool expect = true;
             int guard = 0;
-            while (k < e && guard++ < 500)
+            while (k < e && guard++ < 20000)
             {
                 if (expect)
                 {
@@ -3971,7 +4389,7 @@ namespace SPA_NS
                     // var sb = new StringBuilder("SELECT ...")
                     int nk = open - 2;
                     while (nk > m.BodyStart && !(IsI(t, nk) && t[nk].Text == "new")) nk--;
-                    if (IsP(t, nk - 1, "=") && IsI(t, nk - 2)) fr.GroupVar = t[nk - 2].Text;
+                    if (IsP(t, nk - 1, "=") && IsI(t, nk - 2)) { fr.GroupVar = t[nk - 2].Text; fr.GroupStart = true; }
                 }
                 else if (BuilderCallee.IsMatch(callee) && recv != null && recv.Count >= 1 && !recv[0].IsCall && recv.All(s => !s.IsCall || BuilderCallee.IsMatch(s.Name)))
                 {
@@ -4002,7 +4420,10 @@ namespace SPA_NS
                 // cmd.CommandText = "PCK.SP";  sql += "...";  sql = "...";
                 if (tokStart >= 2 && IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 2) && t[tokStart - 2].Text == "CommandText" && BodyHasIdent(m, "StoredProcedure")) fr.SpContext = true;
                 if (tokStart >= 2 && (IsP(t, tokStart - 1, "+=") || (IsP(t, tokStart - 1, "=") && !IsI(t, tokStart - 3) && !IsP(t, tokStart - 3, ".")) || (IsP(t, tokStart - 1, "=") && IsI(t, tokStart - 3) && (t[tokStart - 3].Text == "var" || t[tokStart - 3].Text == "string"))) && IsI(t, tokStart - 2))
+                {
                     fr.GroupVar = t[tokStart - 2].Text;
+                    fr.GroupStart = IsP(t, tokStart - 1, "=");   // "x = ..." o "var x = ...": valor nuevo; "x += ...": continuacion
+                }
                 else if (tokStart >= 4 && IsP(t, tokStart - 1, "+") && IsI(t, tokStart - 2) && IsP(t, tokStart - 3, "=") && IsI(t, tokStart - 4) && t[tokStart - 4].Text == t[tokStart - 2].Text)
                     fr.GroupVar = t[tokStart - 2].Text;
             }
@@ -4094,15 +4515,23 @@ namespace SPA_NS
         List<Fragment> MergeBuilders(MethodDecl m, List<Fragment> raw)
         {
             var result = new List<Fragment>();
-            var groups = new Dictionary<string, List<Fragment>>();
+            var open = new Dictionary<string, List<Fragment>>();
+            var closed = new List<KeyValuePair<string, List<Fragment>>>();
             foreach (var fr in raw.OrderBy(x => x.TokStart))
             {
                 if (fr.GroupVar == null) { result.Add(fr); continue; }
                 List<Fragment> l;
-                if (!groups.TryGetValue(fr.GroupVar, out l)) { l = new List<Fragment>(); groups[fr.GroupVar] = l; }
+                // una asignacion simple (sql = "...") reemplaza el valor: empieza un grupo nuevo
+                if (open.TryGetValue(fr.GroupVar, out l) && fr.GroupStart && l.Count > 0)
+                {
+                    closed.Add(new KeyValuePair<string, List<Fragment>>(fr.GroupVar, l));
+                    l = null;
+                }
+                if (l == null) { l = new List<Fragment>(); open[fr.GroupVar] = l; }
                 l.Add(fr);
             }
-            foreach (var kv in groups)
+            foreach (var kv in open) closed.Add(kv);
+            foreach (var kv in closed)
             {
                 var l = kv.Value;
                 if (l.Count == 1) { result.Add(l[0]); continue; }
@@ -4248,6 +4677,10 @@ namespace SPA_NS
                 int[] a0 = args[0];
                 foreach (var a in args) if (IsI(t, a[0]) && IsP(t, a[0] + 1, ":") && Regex.IsMatch(t[a[0]].Text, "^(sql|commandText|command)$", RegexOptions.IgnoreCase)) { a0 = new int[] { a[0] + 2, a[1] }; break; }
                 if (ma.Fragments.Any(fr => fr.TokStart < a0[1] && fr.TokEnd > a0[0])) continue;
+                // el texto viene de un metodo (ArmarSql(), sb.ToString(), helper.Get()): se sigue por el grafo de llamadas
+                bool hasCall = false;
+                for (int q = a0[0]; q < a0[1]; q++) if (IsP(t, q, "(")) { hasCall = true; break; }
+                if (hasCall) continue;
                 // CommandDefinition / variable con valor conocido / parametro de un wrapper: no se avisa
                 if (IsI(t, a0[0]) && t[a0[0]].Text == "new") continue;
                 // StringBuilder o variable acumulada: sb.ToString() / sql
@@ -4265,6 +4698,9 @@ namespace SPA_NS
                         int declTok = li.ExprTok;
                         int declEnd = declTok >= 0 ? ix.P(f).FindStmtEnd(declTok, m.BodyEnd) : -1;
                         if (declTok >= 0 && ma.Fragments.Any(fr => fr.TokStart >= declTok - 3 && fr.TokStart <= declEnd)) continue;
+                        bool initCall = false;
+                        for (int q = Math.Max(0, declTok); declTok >= 0 && q < declEnd; q++) if (IsP(t, q, "(")) { initCall = true; break; }
+                        if (initCall) continue;   // var sql = ArmarSql(): el texto sale de otro metodo
                         if (ma.Fragments.Any(fr => fr.GroupVar == n)) continue;
                     }
                     var mv = ix.ResolveMemberChain(new List<string> { n }, m.Owner);
@@ -4500,8 +4936,9 @@ namespace SPA_NS
         {
             for (int i = 0; i < a.Positional.Count; i++)
             {
-                if (a.PositionalIsString[i]) return a.Positional[i];
+                // se evalua siempre (literal, interpolado con constantes $"{R.Version}/x" o concatenacion)
                 if (i < a.PosArgs.Count) { var v = ArgString(a.PosArgs[i], ctx); if (v != null) return v; }
+                if (a.PositionalIsString[i]) return a.Positional[i];
             }
             ArgRef nr;
             if (a.NamedArgs.TryGetValue("template", out nr)) return ArgString(nr, ctx);
@@ -4629,9 +5066,11 @@ namespace SPA_NS
                     foreach (var md in c.Methods)
                     {
                         if (md.IsCtor || md.IsStatic || !md.IsPublic || md.IsAbstract || !md.HasBody || md.IsSynthetic || md.IsLocalFunction) continue;
+                        if (md.AccessorKind != null || md.ExplicitIface != null || md.Name.StartsWith("op_") || md.Name.StartsWith("~")) continue;
                         if (Attr(md.Attrs, "NonAction") != null) continue;
                         if (md.Name == "Dispose" || md.Name == "ToString" || md.Name == "Equals" || md.Name == "GetHashCode") continue;
-                        string sig = md.Name + "/" + md.Params.Count;
+                        // firma con tipos: dos sobrecargas con la misma cantidad de parametros son acciones distintas
+                        string sig = md.Name + "(" + string.Join(",", md.Params.Select(p => p.Type != null ? p.Type.ToString() : "?").ToArray()) + ")";
                         if (!seen.Add(sig)) continue;
                         actions.Add(md);
                     }
@@ -5300,9 +5739,31 @@ namespace SPA_NS
         SourceFile LoadText(string path)
         {
             var sf = new SourceFile { Path = path, Rel = Rel(path) };
-            sf.Text = File.ReadAllText(path);
+            string enc;
+            string text = ReadSource(path, out enc);
+            if (enc == "windows-1252") Res.EncodingNotes.Add(sf.Rel);
+            // CR suelto, NEL, LS y PS tambien terminan linea en C#: se normalizan a LF (CRLF -> LF conserva el numero de linea)
+            text = text.Replace("\r\n", "\n").Replace('\r', '\n').Replace((char)0x85, '\n').Replace((char)0x2028, '\n').Replace((char)0x2029, '\n');
+            sf.Text = text;
             sf.LineStarts = SourceFile.ComputeLineStarts(sf.Text);
             return sf;
+        }
+
+        // UTF-8/UTF-16/UTF-32 con BOM; sin BOM: UTF-8 estricto y, si no es valido, Windows-1252 (fuentes legacy en ANSI)
+        static string ReadSource(string path, out string encName)
+        {
+            var bytes = File.ReadAllBytes(path);
+            encName = "utf-8";
+            if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) return new UTF8Encoding(false).GetString(bytes, 3, bytes.Length - 3);
+            if (bytes.Length >= 4 && bytes[0] == 0xFF && bytes[1] == 0xFE && bytes[2] == 0 && bytes[3] == 0) { encName = "utf-32"; return new UTF32Encoding(false, true).GetString(bytes, 4, bytes.Length - 4); }
+            if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) { encName = "utf-16"; return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2); }
+            if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) { encName = "utf-16be"; return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2); }
+            try { return new UTF8Encoding(false, true).GetString(bytes); }
+            catch (DecoderFallbackException) { }
+            encName = "windows-1252";
+            Encoding ansi;
+            try { ansi = Encoding.GetEncoding(1252); } catch { ansi = Encoding.GetEncoding("iso-8859-1"); }
+            return ansi.GetString(bytes);
         }
 
         public void Execute()
@@ -5338,6 +5799,15 @@ namespace SPA_NS
             foreach (var path in Opt.ConfigFiles)
             {
                 try { LoadConfig(path); } catch (Exception ex) { Res.ParseErrors.Add(Rel(path) + ": " + ex.Message); }
+            }
+            // global using / global using static / alias globales: aplican a todos los archivos
+            var gUsings = Ix.Files.SelectMany(x => x.GlobalUsings).Distinct().ToList();
+            var gAliases = new Dictionary<string, string>();
+            foreach (var x in Ix.Files) foreach (var kv in x.GlobalAliases) gAliases[kv.Key] = kv.Value;
+            foreach (var x in Ix.Files)
+            {
+                foreach (var u in gUsings) if (!x.Usings.Contains(u)) x.Usings.Add(u);
+                foreach (var kv in gAliases) if (!x.Aliases.ContainsKey(kv.Key)) x.Aliases[kv.Key] = kv.Value;
             }
             Ix.Build(types, methods);
             Res.FilesCs = Ix.Files.Count; Res.FilesSql = Ix.SqlFiles.Count; Res.Types = Ix.Types.Count; Res.Methods = Ix.Methods.Count;
@@ -5376,7 +5846,10 @@ namespace SPA_NS
                 if (ep.Handler != null)
                 {
                     var visited = new Dictionary<string, int>();
+                    curMarkerTrace = new Dictionary<string, string>();
+                    foreach (var mk in ep.ExtraMarkers) curMarkerTrace[mk.Id] = ep.HandlerName;
                     Dfs(ep, ep.Handler, ep.ViaType, ep.ExtraMarkers, "ep", 0, new List<string>(), false, visited, items, markers, used, visitedAll, trace, unresolved, warns);
+                    epMarkerTrace[ep.Id] = curMarkerTrace;
                 }
                 foreach (var it in items) AddToCatalog(it.Fr, it.Dec);
                 perEp[ep.Id] = items; epMarkers[ep.Id] = markers; epUsed[ep.Id] = used;
@@ -5489,7 +5962,12 @@ namespace SPA_NS
                  Dictionary<string, int> visited, List<RawItem> items, List<Marker> markers, HashSet<string> used, HashSet<string> visitedAll,
                  List<string> trace, HashSet<string> unresolved, List<Warn> warns)
         {
-            if (m == null || depth > Opt.MaxDepth) return;
+            if (m == null) return;
+            if (depth > Opt.MaxDepth)
+            {
+                if (m.HasBody) warns.Add(new Warn { Category = "Profundidad máxima", Message = "Se alcanzó -MaxDepth (" + Opt.MaxDepth + ") al llegar a " + m.DisplayName + ": puede haber SP más profundos sin analizar (use un -MaxDepth mayor)", Loc = new Location(m.File, m.Line) });
+                return;
+            }
             string key = m.Id + "|" + inhKey + "|" + (thisType != null ? thisType.Id : "-");
             int prevDepth;
             // se vuelve a visitar si ahora se llega por un camino mas corto (el anterior pudo cortarse por -MaxDepth)
@@ -5504,12 +5982,14 @@ namespace SPA_NS
             markers.AddRange(ma.MethodMarkers);
             markers.AddRange(ma.WeakMarkers);
             foreach (var b in ma.Blocks) markers.AddRange(b.Markers);
+            foreach (var mk in ma.MethodMarkers.Concat(ma.WeakMarkers).Concat(ma.Blocks.SelectMany(b => b.Markers))) if (!curMarkerTrace.ContainsKey(mk.Id)) curMarkerTrace[mk.Id] = traceStr;
             warns.AddRange(ma.Warnings);
             foreach (var fr in ma.Fragments)
             {
                 if (fr.MessageContext) continue;
                 var dec = Decide(fr, ma, inherited);
                 markers.AddRange(fr.InlineMarkers); markers.AddRange(fr.ConstMarkers);
+                foreach (var mk in fr.InlineMarkers.Concat(fr.ConstMarkers)) if (!curMarkerTrace.ContainsKey(mk.Id)) curMarkerTrace[mk.Id] = traceStr;
                 foreach (var u in dec.Used) used.Add(u.Id);
                 items.Add(new RawItem { Fr = fr, Dec = dec, Trace = traceStr, InferredPath = inferredPath });
                 if (fr.HasDynamicSp)
@@ -5546,6 +6026,7 @@ namespace SPA_NS
                     if (!x.M.HasBody && x.M.Owner != null && (x.M.Owner.Kind == "interface" || x.M.IsAbstract))
                         foreach (var mk in Fx.Analyze(x.M).MethodMarkers) if (!ifaceMarkers.Any(y => y.Sp.Key == mk.Sp.Key)) ifaceMarkers.Add(mk);
                 markers.AddRange(ifaceMarkers);
+                foreach (var mk in ifaceMarkers) if (!curMarkerTrace.ContainsKey(mk.Id)) curMarkerTrace[mk.Id] = traceStr;
                 foreach (var x in tg)
                 {
                     if (x.M == m) continue;
@@ -5598,6 +6079,9 @@ namespace SPA_NS
         }
 
         // ------------------------------------------------------------ filas
+        Dictionary<string, string> curMarkerTrace = new Dictionary<string, string>();
+        Dictionary<string, Dictionary<string, string>> epMarkerTrace = new Dictionary<string, Dictionary<string, string>>();
+
         void BuildRows(Endpoint ep, List<RawItem> items, List<Marker> markers, HashSet<string> used)
         {
             var rows = new List<ResultRow>();
@@ -5623,6 +6107,14 @@ namespace SPA_NS
                         r.Loc = new Location(fr.File, fr.Line);
                     }
                     else if (fr.Origin == "sqlfile") r.Detail = "archivo .sql usado en " + fr.File.Rel + ":" + fr.Line;
+                    else if (fr.Kind == "bare" && (h.Loc.File != fr.File || h.Loc.Line < fr.Line || h.Loc.Line > fr.EndLine))
+                    {
+                        // nombre armado con constantes (Concat/Format/interpolacion): la ubicacion es el uso
+                        r.Loc = new Location(fr.File, fr.Line);
+                        r.Detail = fr.ConstRef != null
+                            ? "constante " + (fr.ConstRef.Owner != null ? fr.ConstRef.Owner.Name + "." : "") + fr.ConstRef.Name + " definida en " + fr.ConstRef.File.Rel + ":" + fr.ConstRef.Line
+                            : "nombre armado con constantes (" + h.Loc.Key + ")";
+                    }
                     else if (h.Loc.File != fr.File || fr.Pieces.Any(pc => pc.Const != null)) r.Detail = "usado en " + fr.File.Rel + ":" + fr.Line;
                     r.Form = FormText(fr);
                     AddLink(r, h.Sp); add(r);
@@ -5676,7 +6168,10 @@ namespace SPA_NS
                 if (used.Contains(mk.Id)) continue;
                 if (reported.Any(x => x.SameAs(mk.Sp))) continue;
                 if (!soloSeen.Add(mk.Sp.Key)) continue;
-                add(new ResultRow { Ep = ep, Sp = mk.Sp, Tipo = "SOLO_COMENTARIO", Loc = mk.Loc, Detail = MarkerDetail(mk), Trace = "" });
+                Dictionary<string, string> mt;
+                string mtr = "";
+                if (epMarkerTrace.TryGetValue(ep.Id, out mt)) mt.TryGetValue(mk.Id, out mtr);
+                add(new ResultRow { Ep = ep, Sp = mk.Sp, Tipo = "SOLO_COMENTARIO", Loc = mk.Loc, Detail = MarkerDetail(mk), Trace = mtr ?? "" });
             }
             Res.Rows.AddRange(rows);
             if (rows.Count == 0)
@@ -5772,6 +6267,9 @@ namespace SPA_NS
                     foreach (var h in Sm.FindInCode(scan.Blank, scan.Kind == "bare", scan.Kind == "bare" || scan.Kind == "pure"))
                         Res.Orphans.Add(new OrphanRef { Sp = h.Sp, Loc = new Location(mv.File, mv.Line), Context = td.Name + "." + mv.Name, Kind = "codigo", Detail = "constante no referenciada" });
                 }
+            // menciones en comentarios de SP que ya aparecen en algun endpoint (p.ej. el /// de una interfaz) no son huerfanas
+            var reportedKeys = new HashSet<string>(Res.Rows.SelectMany(r => new SpName[] { r.Sp, r.Child }).Where(x => x != null).Select(x => x.Key));
+            Res.Orphans = Res.Orphans.Where(o => o.Kind != "comentario" || !(reportedLocs.Contains(o.Loc.Key) || reportedKeys.Contains(o.Sp.Key))).ToList();
             Res.Orphans = Res.Orphans.Where(o => !reportedLocs.Contains(o.Loc.Key) || o.Kind == "comentario")
                 .GroupBy(o => o.Sp.Key + "|" + o.Loc.Key + "|" + o.Kind).Select(g => g.First()).ToList();
         }
@@ -6293,10 +6791,11 @@ W '  - los métodos de extensión.'
 W '- Cuando hay varios comentarios, el SP migrado se asocia a su query con el comentario más cercano. El orden de prioridad es:'
 W '  1. comentario SQL dentro de la query;'
 W '  2. comentario sobre la constante SQL;'
-W '  3. comentario previo en el mismo método;'
-W '  4. XML doc, comentarios o atributos del método;'
-W '  5. comentario de un método llamador (&dagger;);'
+W '  3. comentario previo en el mismo método, dentro de su bloque `{ }`;'
+W '  4. XML doc, comentarios o atributos del método (las menciones en logs, solo si no hay nada de lo anterior);'
+W '  5. documentación del método de la interfaz o comentario de un método llamador (&dagger;);'
 W '  6. comentario de la clase, solo si nombra un único SP.'
+W '- Las queries armadas con `StringBuilder`, `+=`, `string.Format` o `AppendFormat` se unen en una sola query. Los strings que no son comandos se ignoran: comparaciones, valores de parámetros y respuestas HTTP.'
 W '- Un comentario que nombra un SP que la misma query ya llama solo documenta esa llamada; no la convierte en migración.'
 W '- Exclusiones:'
 W '  - las carpetas `bin`, `obj`, `.git`, `node_modules` y `packages`, y las de documentación (`docs`, ...);'

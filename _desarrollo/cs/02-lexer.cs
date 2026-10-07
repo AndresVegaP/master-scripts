@@ -93,8 +93,139 @@ namespace SPA_NS
                 toks.Add(new Token { Kind = TokKind.Punct, Start = i, End = i + p.Length, Text = p });
                 i += p.Length;
             }
-            foreach (var t in toks) { t.Line = f.LineOf(t.Start); t.EndLine = f.LineOf(Math.Max(t.Start, t.End - 1)); }
+            ApplyPreprocessor(f);
+            foreach (var t in f.Toks) { t.Line = f.LineOf(t.Start); t.EndLine = f.LineOf(Math.Max(t.Start, t.End - 1)); }
             ComputeMatch(f);
+        }
+
+        class PpBranch { public int Start, End; public bool? Cond; public bool IsElse; }
+
+        // #if/#elif/#else/#endif: descarta ramas estaticamente falsas y, si las ramas desconocidas
+        // desbalancean las llaves, conserva una sola (la del #else si existe) para no romper la estructura.
+        static void ApplyPreprocessor(SourceFile f)
+        {
+            var dirs = f.Comments.Where(c => c.IsPreproc).ToList();
+            if (!dirs.Any(d => Regex.IsMatch(d.Text, @"^\s*#\s*if\b"))) return;
+            var defined = new HashSet<string>(StringComparer.Ordinal);
+            var undefined = new HashSet<string>(StringComparer.Ordinal);
+            var stack = new List<List<PpBranch>>();
+            var drops = new List<int[]>();
+            foreach (var d in dirs)
+            {
+                var mm = Regex.Match(d.Text, @"^\s*#\s*(\w+)\s*(.*)$");
+                if (!mm.Success) continue;
+                string kw = mm.Groups[1].Value, rest = Regex.Replace(mm.Groups[2].Value, @"//.*$", "").Trim();
+                switch (kw)
+                {
+                    case "define": defined.Add(rest); undefined.Remove(rest); break;
+                    case "undef": undefined.Add(rest); defined.Remove(rest); break;
+                    case "if":
+                        stack.Add(new List<PpBranch> { new PpBranch { Start = d.End, End = -1, Cond = EvalPp(rest, defined, undefined) } });
+                        break;
+                    case "elif":
+                    case "else":
+                        if (stack.Count == 0) break;
+                        var g = stack[stack.Count - 1];
+                        g[g.Count - 1].End = d.Start;
+                        g.Add(new PpBranch { Start = d.End, End = -1, Cond = kw == "elif" ? EvalPp(rest, defined, undefined) : null, IsElse = kw == "else" });
+                        break;
+                    case "endif":
+                        if (stack.Count == 0) break;
+                        var grp = stack[stack.Count - 1];
+                        stack.RemoveAt(stack.Count - 1);
+                        grp[grp.Count - 1].End = d.Start;
+                        DecideGroup(f, grp, drops);
+                        break;
+                }
+            }
+            if (drops.Count == 0) return;
+            Func<int, bool> dropped = off => drops.Any(r => off >= r[0] && off < r[1]);
+            f.Toks = f.Toks.Where(t => !dropped(t.Start)).ToList();
+            f.Comments = f.Comments.Where(c => c.IsPreproc || !dropped(c.Start)).ToList();
+        }
+
+        static void DecideGroup(SourceFile f, List<PpBranch> grp, List<int[]> drops)
+        {
+            var keep = new List<PpBranch>();
+            bool priorTrue = false, allPriorFalse = true;
+            foreach (var b in grp)
+            {
+                bool? c = b.IsElse ? (priorTrue ? (bool?)false : (allPriorFalse ? (bool?)true : null)) : b.Cond;
+                if (priorTrue) c = false;
+                if (c == true) { priorTrue = true; keep.Clear(); keep.Add(b); continue; }
+                if (c == null) { allPriorFalse = false; keep.Add(b); }
+            }
+            if (!priorTrue && keep.Count > 1)
+            {
+                // ramas desconocidas: si alguna desbalancea las llaves, se conserva una sola
+                bool unbalanced = keep.Any(b => BraceDelta(f, b) != 0);
+                if (unbalanced)
+                {
+                    var one = keep.FirstOrDefault(b => b.IsElse) ?? keep[0];
+                    keep = new List<PpBranch> { one };
+                }
+            }
+            foreach (var b in grp) if (!keep.Contains(b) && b.End > b.Start) drops.Add(new int[] { b.Start, b.End });
+        }
+
+        static int BraceDelta(SourceFile f, PpBranch b)
+        {
+            int d = 0;
+            foreach (var t in f.Toks)
+            {
+                if (t.Start < b.Start) continue;
+                if (t.Start >= b.End) break;
+                if (t.Kind == TokKind.Punct) { if (t.Text == "{") d++; else if (t.Text == "}") d--; }
+            }
+            return d;
+        }
+
+        // evaluacion de tres estados: true / false / null (desconocido)
+        static bool? EvalPp(string expr, HashSet<string> defined, HashSet<string> undefined)
+        {
+            var toks = Regex.Matches(expr, @"\w+|&&|\|\||==|!=|!|\(|\)").Cast<Match>().Select(x => x.Value).ToList();
+            int pos = 0;
+            return PpOr(toks, ref pos, defined, undefined);
+        }
+
+        static bool? PpOr(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            var l = PpAnd(t, ref p, d, u);
+            while (p < t.Count && t[p] == "||") { p++; var r = PpAnd(t, ref p, d, u); l = (l == true || r == true) ? true : (l == false && r == false) ? (bool?)false : null; }
+            return l;
+        }
+
+        static bool? PpAnd(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            var l = PpEq(t, ref p, d, u);
+            while (p < t.Count && t[p] == "&&") { p++; var r = PpEq(t, ref p, d, u); l = (l == false || r == false) ? false : (l == true && r == true) ? (bool?)true : null; }
+            return l;
+        }
+
+        static bool? PpEq(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            var l = PpUnary(t, ref p, d, u);
+            while (p < t.Count && (t[p] == "==" || t[p] == "!="))
+            {
+                bool eq = t[p] == "=="; p++;
+                var r = PpUnary(t, ref p, d, u);
+                l = (l == null || r == null) ? null : (bool?)(eq ? l == r : l != r);
+            }
+            return l;
+        }
+
+        static bool? PpUnary(List<string> t, ref int p, HashSet<string> d, HashSet<string> u)
+        {
+            if (p >= t.Count) return null;
+            string x = t[p];
+            if (x == "!") { p++; var v = PpUnary(t, ref p, d, u); return v == null ? null : (bool?)!v.Value; }
+            if (x == "(") { p++; var v = PpOr(t, ref p, d, u); if (p < t.Count && t[p] == ")") p++; return v; }
+            p++;
+            if (x == "true" || x == "1") return true;
+            if (x == "false" || x == "0") return false;
+            if (d.Contains(x)) return true;
+            if (u.Contains(x)) return false;
+            return null;
         }
 
         static void AddComment(SourceFile f, int s, int e, bool doc, bool pre)

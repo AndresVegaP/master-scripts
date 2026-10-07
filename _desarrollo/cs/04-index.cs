@@ -25,6 +25,7 @@ namespace SPA_NS
         public bool IsNew, IsMethodGroup;
         public TypeRef NewType;
         public int ArgOpen = -1;
+        public string PropertyAccess;     // get / set: acceso a propiedad o indexador con cuerpo
     }
 
     // destino de una llamada: metodo y tipo concreto a traves del cual se llega (para despacho virtual)
@@ -85,6 +86,7 @@ namespace SPA_NS
         public Dictionary<SourceFile, Parser> Parsers = new Dictionary<SourceFile, Parser>();
         public Dictionary<string, List<TypeDecl>> NestedByOuter = new Dictionary<string, List<TypeDecl>>();
         public HashSet<string> ReferencedConsts = new HashSet<string>();
+        public HashSet<string> PropertyNames = new HashSet<string>(StringComparer.Ordinal);   // propiedades/indexadores con cuerpo
         public bool TrackRefs;
         Dictionary<string, Dictionary<string, LocalInfo>> localsCache = new Dictionary<string, Dictionary<string, LocalInfo>>();
         Dictionary<string, List<CallSite>> callsCache = new Dictionary<string, List<CallSite>>();
@@ -166,6 +168,7 @@ namespace SPA_NS
             }
             // funciones locales (incluidas las de Program.cs con top-level statements)
             foreach (var md in Methods.ToList()) if (md.HasBody) FindLocalFunctions(md);
+            foreach (var md in Methods) if (md.AccessorKind != null) PropertyNames.Add(md.Name);
             // ancestros e implementadores
             foreach (var td in Types)
             {
@@ -460,6 +463,13 @@ namespace SPA_NS
         public List<TypeDecl> ResolveTypeName(string name, TypeDecl ctx)
         {
             List<TypeDecl> c;
+            // alias: using Repo = A.B.ClientesRepository;
+            string aliasTarget;
+            if (name != null && ctx != null && ctx.Aliases != null && ctx.Aliases.TryGetValue(name, out aliasTarget))
+            {
+                var aq = ResolveQualifiedNoAlias(aliasTarget.Split('.').ToList());
+                if (aq.Count > 0) return aq;
+            }
             if (name == null || !TypesByName.TryGetValue(name, out c)) return new List<TypeDecl>();
             if (c.Count == 1 || ctx == null) return c;
             ctx = ctx.MergedInto ?? ctx;
@@ -500,6 +510,15 @@ namespace SPA_NS
         {
             if (names.Count == 0) return new List<TypeDecl>();
             if (names.Count == 1) return ResolveTypeName(names[0], ctx);
+            string aliasTarget;
+            if (ctx != null && ctx.Aliases != null && ctx.Aliases.TryGetValue(names[0], out aliasTarget))
+                names = aliasTarget.Split('.').Concat(names.Skip(1)).ToList();
+            return ResolveQualifiedNoAlias(names);
+        }
+
+        List<TypeDecl> ResolveQualifiedNoAlias(List<string> names)
+        {
+            if (names.Count == 0) return new List<TypeDecl>();
             string qual = string.Join(".", names.ToArray());
             List<TypeDecl> all;
             if (TypesByName.TryGetValue(names[names.Count - 1], out all))
@@ -578,27 +597,58 @@ namespace SPA_NS
             r.Add(new Target { M = m, Via = via, Inferred = inferred });
         }
 
+        // bases de un tipo con los argumentos genericos sustituidos a lo largo de la jerarquia:
+        // ClientesRepository : Repository<Cliente>, Repository<T> : IRepository<T>  =>  IRepository<Cliente>
+        Dictionary<string, List<TypeRef>> substBaseCache = new Dictionary<string, List<TypeRef>>();
+        public List<TypeRef> SubstitutedBaseRefs(TypeDecl td)
+        {
+            List<TypeRef> r;
+            if (substBaseCache.TryGetValue(td.Id, out r)) return r;
+            r = new List<TypeRef>();
+            substBaseCache[td.Id] = r;
+            var queue = new Queue<KeyValuePair<KeyValuePair<TypeRef, TypeDecl>, Dictionary<string, TypeRef>>>();
+            foreach (var b in td.Bases) queue.Enqueue(new KeyValuePair<KeyValuePair<TypeRef, TypeDecl>, Dictionary<string, TypeRef>>(new KeyValuePair<TypeRef, TypeDecl>(b, td), new Dictionary<string, TypeRef>()));
+            var seen = new HashSet<string>();
+            int guard = 0;
+            while (queue.Count > 0 && guard++ < 300)
+            {
+                var it = queue.Dequeue();
+                var b = Subst(it.Key.Key, it.Value);
+                r.Add(b);
+                foreach (var bd in ResolveTypeRef(b, it.Key.Value))
+                {
+                    if (!seen.Add(bd.Id + "|" + b.ToString())) continue;
+                    var map = new Dictionary<string, TypeRef>();
+                    for (int i = 0; i < bd.TypeParams.Count && i < b.Args.Count; i++) map[bd.TypeParams[i]] = b.Args[i];
+                    foreach (var bb in bd.Bases) queue.Enqueue(new KeyValuePair<KeyValuePair<TypeRef, TypeDecl>, Dictionary<string, TypeRef>>(new KeyValuePair<TypeRef, TypeDecl>(bb, bd), map));
+                }
+            }
+            return r;
+        }
+
         // true si el implementador "it" es compatible con los argumentos genericos cerrados del receptor (IRepository<Producto>)
         bool GenericCompatible(TypeDecl it, TypeDecl recvType, List<TypeRef> recvRefs)
         {
             if (recvRefs == null) return true;
             var rr = recvRefs.FirstOrDefault(x => x.Name == recvType.Name && x.Args.Count > 0);
             if (rr == null) return true;
-            foreach (var b in AllBaseRefs(it))
+            bool any = false;
+            foreach (var b in SubstitutedBaseRefs(it))
             {
                 if (b.Name != recvType.Name || b.Args.Count != rr.Args.Count) continue;
+                any = true;
                 bool ok = true;
                 for (int i = 0; i < b.Args.Count; i++)
                 {
                     string ba = b.Args[i].Name, ra = rr.Args[i].Name;
                     if (ba == ra) continue;
-                    // parametro generico del implementador (Repository<T>) o de alguna base intermedia
-                    if (it.TypeParams.Contains(ba) || (ba.Length <= 2 && char.IsUpper(ba[0])) || ba.StartsWith("T") && !TypesByName.ContainsKey(ba)) continue;
+                    // parametro generico propio del implementador (Repository<T> sin cerrar)
+                    if (it.TypeParams.Contains(ba)) continue;
                     ok = false; break;
                 }
                 if (ok) return true;
             }
-            return false;
+            return !any;
         }
 
         public List<Target> FindMethods(List<TypeDecl> types, string name, int argc, List<TypeRef> recvRefs, bool noPoly)
@@ -607,6 +657,8 @@ namespace SPA_NS
             foreach (var td in types)
             {
                 var direct = MethodsNamed(td, name, true);
+                // las implementaciones explicitas (IFoo.Metodo) solo son accesibles a traves de la interfaz
+                if (td.Kind != "interface") direct = direct.Where(x => x.ExplicitIface == null).ToList();
                 foreach (var md in direct) AddT(r, md, td, false);
                 if (noPoly) continue;
                 bool poly = td.Kind == "interface" || td.IsAbstract || direct.Any(x => x.IsAbstract || x.IsVirtual || !x.HasBody);
@@ -618,7 +670,14 @@ namespace SPA_NS
                 foreach (var it in concrete)
                 {
                     if (!GenericCompatible(it, td, recvRefs)) continue;
-                    foreach (var md in MethodsNamed(it, name, true)) AddT(r, md, it, false);
+                    var ms = MethodsNamed(it, name, true);
+                    bool hasExplicit = td.Kind == "interface" && ms.Any(x => x.ExplicitIface == td.Name);
+                    foreach (var md in ms)
+                    {
+                        if (md.ExplicitIface != null && md.ExplicitIface != td.Name) continue;
+                        if (hasExplicit && md.ExplicitIface == null && md.Owner == it) continue;   // la explicita gana via esa interfaz
+                        AddT(r, md, it, false);
+                    }
                 }
             }
             return FilterArgcT(r, argc, false);
@@ -973,7 +1032,11 @@ namespace SPA_NS
                     int j = k + 1;
                     if (IsP(t, j, "(") || IsP(t, j, "[") || IsP(t, j, "{")) continue;
                     var tr = p.ParseTypeRef(ref j);
-                    if (tr != null) r.Add(new CallSite { IsNew = true, NewType = tr, Name = tr.Name, Tok = k, Line = tk.Line });
+                    if (tr != null)
+                    {
+                        r.Add(new CallSite { IsNew = true, NewType = tr, Name = tr.Name, Tok = k, Line = tk.Line });
+                        k = j - 1;   // new A.B.Query(...): el nombre del tipo no es una llamada
+                    }
                     continue;
                 }
                 if (U.IsKeyword(tk.Text) && tk.Text != "this" && tk.Text != "base") continue;
@@ -993,6 +1056,25 @@ namespace SPA_NS
                     r.Add(cs);
                     continue;
                 }
+                // acceso a propiedad o indexador con cuerpo: _repo.Total / _repo.Limite = v / _repo[id]
+                if (PropertyNames.Count > 0)
+                {
+                    int st;
+                    bool isIdx = IsP(t, k + 1, "[") && mt[k + 1] > k && PropertyNames.Contains("this[]") && !U.IsKeyword(tk.Text);
+                    if (isIdx)
+                    {
+                        var recvI = afterDot ? WalkBack(f, k - 1, out st) : new List<Seg>();
+                        recvI.Add(new Seg { Name = tk.Text });
+                        r.Add(new CallSite { Name = "this[]", Receiver = recvI, Argc = -2, Tok = k, Line = tk.Line, PropertyAccess = IsAssign(t, mt[k + 1] + 1) ? "set" : "get" });
+                    }
+                    bool initProp = !afterDot && (IsP(t, k - 1, "{") || IsP(t, k - 1, ",")) && IsAssign(t, k + 1);
+                    if (PropertyNames.Contains(tk.Text) && !initProp && (afterDot || (!Locals(m).ContainsKey(tk.Text) && !m.Params.Any(pp => pp.Name == tk.Text))))
+                    {
+                        var recvP = afterDot ? WalkBack(f, k - 1, out st) : new List<Seg>();
+                        r.Add(new CallSite { Name = tk.Text, Receiver = recvP, Argc = -2, Tok = k, Line = tk.Line, PropertyAccess = (!isIdx && IsAssign(t, k + 1)) ? "set" : "get" });
+                        continue;
+                    }
+                }
                 // grupo de metodos pasado como delegado: (X) , X ,  obj.X , Tipo.X
                 if ((IsP(t, k + 1, ",") || IsP(t, k + 1, ")")) && !U.IsKeyword(tk.Text)
                     && (afterDot || (!Locals(m).ContainsKey(tk.Text) && !m.Params.Any(pp => pp.Name == tk.Text))))
@@ -1005,6 +1087,13 @@ namespace SPA_NS
                 }
             }
             return r;
+        }
+
+        static bool IsAssign(List<Token> t, int i)
+        {
+            if (i < 0 || i >= t.Count || t[i].Kind != TokKind.Punct) return false;
+            string x = t[i].Text;
+            return x == "=" || x == "+=" || x == "-=" || x == "*=" || x == "/=" || x == "%=" || x == "&=" || x == "|=" || x == "^=" || x == "??=";
         }
 
         static bool IsDeclContext(List<Token> t, int typeTok)
@@ -1109,6 +1198,13 @@ namespace SPA_NS
         // Resuelve una llamada a metodos del repo. thisType = tipo concreto del objeto actual (despacho virtual).
         public List<Target> ResolveTargets(MethodDecl m, CallSite cs, TypeDecl thisType, out bool inferred, out bool unresolvedRepoName)
         {
+            var r = ResolveTargetsCore(m, cs, thisType, out inferred, out unresolvedRepoName);
+            if (cs.PropertyAccess != null) return r.Where(x => x.M.AccessorKind == cs.PropertyAccess).ToList();
+            return r.Where(x => x.M.AccessorKind == null).ToList();
+        }
+
+        List<Target> ResolveTargetsCore(MethodDecl m, CallSite cs, TypeDecl thisType, out bool inferred, out bool unresolvedRepoName)
+        {
             inferred = false; unresolvedRepoName = false;
             var r = new List<Target>();
             if (cs.IsNew) return r;
@@ -1197,9 +1293,11 @@ namespace SPA_NS
             if (recv.Known)
             {
                 // coleccion externa indexada (diccionario de estrategias): avisar si el nombre existe en el repo
-                if (cs.Receiver.Any(x => x.IsIndexer) && MethodsByName.ContainsKey(cs.Name)) unresolvedRepoName = true;
+                if (cs.Receiver.Any(x => x.IsIndexer) && MethodsByName.ContainsKey(cs.Name) && cs.PropertyAccess == null) unresolvedRepoName = true;
                 return r;
             }
+            // acceso a propiedad con receptor desconocido: no se resuelve por nombre (evita falsos positivos)
+            if (cs.PropertyAccess != null) return r;
             // pista por nombre del receptor: _ventasRepository -> VentasRepository / IVentasRepository
             string hint = cs.Receiver[cs.Receiver.Count - 1].Name.TrimStart('_');
             if (hint.StartsWith("m_") || hint.StartsWith("s_")) hint = hint.Substring(2);
@@ -1431,7 +1529,7 @@ namespace SPA_NS
             int k = s;
             bool expect = true;
             int guard = 0;
-            while (k < e && guard++ < 500)
+            while (k < e && guard++ < 20000)
             {
                 if (expect)
                 {
