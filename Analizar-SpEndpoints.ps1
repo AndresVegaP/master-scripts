@@ -126,6 +126,12 @@ $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 if ((Test-Path -LiteralPath $OutputPath -PathType Container) -or $OutputPath.EndsWith('\') -or $OutputPath.EndsWith('/') -or [string]::IsNullOrEmpty([System.IO.Path]::GetExtension($OutputPath))) {
     $OutputPath = Join-Path $OutputPath 'reporte-sp-endpoints.md'
 }
+if ([System.IO.Path]::GetExtension($OutputPath) -ne '.md') {
+    # el reporte siempre es .md (el CSV opcional se escribe al lado con el mismo nombre)
+    $newOut = [System.IO.Path]::ChangeExtension($OutputPath, '.md')
+    Write-Warning "La salida debe ser un .md: se usará '$newOut'."
+    $OutputPath = $newOut
+}
 $outDir = Split-Path -Parent $OutputPath
 if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
@@ -6417,11 +6423,20 @@ $nl = "`n"
 $outDirFull = [System.IO.Path]::GetDirectoryName($OutputPath)
 $baseUri = New-Object System.Uri (($outDirFull.TrimEnd('\') + '\'))
 
+# texto plano en celdas: sin saltos de linea, "|" escapado y < > & como entidades (Program.<top-level>, Repo<T>)
 function Esc([string]$s) {
     if ($null -eq $s) { return '' }
-    return ($s -replace '\r?\n', ' ' -replace '\|', '\|')
+    $s = $s -replace '\r?\n', ' '
+    $s = $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    return ($s -replace '\|', '\|')
 }
-function Code([string]$s) { if ([string]::IsNullOrEmpty($s)) { return '' } return '`' + (Esc $s) + '`' }
+# span de codigo: dentro no se interpretan entidades; si el texto tiene comillas invertidas se usa doble delimitador
+function Code([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return '' }
+    $v = ($s -replace '\r?\n', ' ') -replace '\|', '\|'
+    if ($v.Contains('`')) { return '`` ' + $v + ' ``' }
+    return '`' + $v + '`'
+}
 function LocLink($loc) {
     if ($null -eq $loc -or $null -eq $loc.File) { return '' }
     $full = $loc.File.Path
@@ -6510,9 +6525,24 @@ foreach ($r in $rows) { $epWithSp[$r.Ep.Id] = 1 }
 $epNoSp = @($endpoints | Where-Object { -not $epWithSp.ContainsKey($_.Id) })
 $epWithCode = @{}
 foreach ($r in $codeRows) { $epWithCode[$r.Ep.Id] = 1 }
-
 # ---------------------------------------------------------------- cruce con Swagger / OpenAPI
 $swaggerInfo = $null
+$swaggerError = $null
+
+# acceso uniforme a objetos de ConvertFrom-Json (PSObject) y de diccionarios (JavaScriptSerializer / -AsHashtable)
+function Get-JsonProp($o, [string]$name) {
+    if ($null -eq $o) { return $null }
+    if ($o -is [System.Collections.IDictionary]) { if ($o.ContainsKey($name)) { return $o[$name] } return $null }
+    $p = $o.PSObject.Properties[$name]
+    if ($p) { return $p.Value }
+    return $null
+}
+function Get-JsonKeys($o) {
+    if ($null -eq $o) { return @() }
+    if ($o -is [System.Collections.IDictionary]) { return @($o.Keys) }
+    return @($o.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
 if (-not [string]::IsNullOrWhiteSpace($SwaggerPath)) {
     try {
         if ($SwaggerPath -match '^https?://') { $json = (Invoke-WebRequest -Uri $SwaggerPath -UseBasicParsing).Content }
@@ -6521,27 +6551,58 @@ if (-not [string]::IsNullOrWhiteSpace($SwaggerPath)) {
             if (-not [System.IO.Path]::IsPathRooted($swp)) { $swp = Join-Path (Get-Location).Path $swp }
             $json = [System.IO.File]::ReadAllText($swp)
         }
-        $doc = $json | ConvertFrom-Json
+        $doc = $null
+        try { $doc = $json | ConvertFrom-Json }
+        catch {
+            # PS 5.1 rechaza claves que solo difieren en mayusculas ("id"/"Id" en schemas): se usa un deserializador sensible a mayusculas
+            if ($PSVersionTable.PSEdition -eq 'Core') { $doc = $json | ConvertFrom-Json -AsHashtable }
+            else {
+                Add-Type -AssemblyName System.Web.Extensions
+                $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+                $ser.MaxJsonLength = [int]::MaxValue
+                $ser.RecursionLimit = 1000
+                $doc = $ser.DeserializeObject($json)
+            }
+        }
         $basePrefix = ''
-        if ($doc.PSObject.Properties['basePath'] -and $doc.basePath) { $basePrefix = ([string]$doc.basePath).TrimEnd('/') }
+        $bp = Get-JsonProp $doc 'basePath'
+        if ($bp) { $basePrefix = ([string]$bp).TrimEnd('/') }
+        else {
+            # OpenAPI 3: ruta de servers[0].url ("https://host/api" o "/api")
+            $servers = Get-JsonProp $doc 'servers'
+            if ($servers) {
+                $s0 = @($servers)[0]
+                $url = [string](Get-JsonProp $s0 'url')
+                if ($url) {
+                    $path = $url
+                    if ($url -match '^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+(?<p>/.*)?$') { $path = $Matches['p'] }
+                    if ($path -and $path -notmatch '\{') { $basePrefix = $path.TrimEnd('/') }
+                }
+            }
+        }
         $norm = { param($v, $r) ($v.ToUpperInvariant() + ' ' + (($r -replace '\{[^}]*\}', '{}').TrimEnd('/').ToLowerInvariant())) }
         $swOps = @{}
-        foreach ($p in $doc.paths.PSObject.Properties) {
-            foreach ($m in $p.Value.PSObject.Properties) {
-                if (@('get', 'post', 'put', 'delete', 'patch', 'head', 'options') -notcontains $m.Name) { continue }
-                $route = $basePrefix + $p.Name
-                $opId = ''
-                if ($m.Value.PSObject.Properties['operationId']) { $opId = $m.Value.operationId }
-                $swOps[(& $norm $m.Name $route)] = @{ Verb = $m.Name.ToUpperInvariant(); Route = $route; OpId = $opId }
+        $paths = Get-JsonProp $doc 'paths'
+        foreach ($pn in (Get-JsonKeys $paths)) {
+            $pv = Get-JsonProp $paths $pn
+            foreach ($mn in (Get-JsonKeys $pv)) {
+                if (@('get', 'post', 'put', 'delete', 'patch', 'head', 'options') -notcontains $mn.ToLowerInvariant()) { continue }
+                $mv = Get-JsonProp $pv $mn
+                $route = $basePrefix + $pn
+                $opId = [string](Get-JsonProp $mv 'operationId')
+                $swOps[(& $norm $mn $route)] = @{ Verb = $mn.ToUpperInvariant(); Route = $route; OpId = $opId }
             }
         }
         $codeOps = @{}
         foreach ($e in $endpoints) { $codeOps[(& $norm $e.Verb $e.Route)] = $e }
         $missingInCode = @($swOps.Keys | Where-Object { -not $codeOps.ContainsKey($_) -and -not $codeOps.ContainsKey((& $norm 'ANY' $swOps[$_].Route)) } | ForEach-Object { $swOps[$_] } | Sort-Object { $_.Route })
         $missingInSwagger = @($endpoints | Where-Object { $_.Verb -ne 'ANY' -and -not $swOps.ContainsKey((& $norm $_.Verb $_.Route)) })
-        $swaggerInfo = @{ Total = $swOps.Count; MissingInCode = $missingInCode; MissingInSwagger = $missingInSwagger }
+        $swaggerInfo = @{ Total = $swOps.Count; MissingInCode = $missingInCode; MissingInSwagger = $missingInSwagger; Prefix = $basePrefix }
     }
-    catch { Write-Warning "No se pudo leer el Swagger '$SwaggerPath': $($_.Exception.Message)" }
+    catch {
+        $swaggerError = $_.Exception.Message
+        Write-Warning "No se pudo leer el Swagger '$SwaggerPath': $swaggerError"
+    }
 }
 
 # ---------------------------------------------------------------- markdown
@@ -6556,7 +6617,7 @@ $now = Get-Date -Format 'yyyy-MM-dd HH:mm'
 W '# Mapa de SP por endpoint'
 W ''
 W ("> Generado el {0} con ``Analizar-SpEndpoints.ps1`` v{1}  " -f $now, $ScriptVersion)
-W ("> Carpeta analizada: ``{0}``  " -f $RepoPath)
+W ("> Carpeta analizada: {0}  " -f (Code $RepoPath))
 W ("> Prefijos de package: {0} &middot; Prefijos de SP/funciones sin package: {1}" -f (($PackagePrefixes | ForEach-Object { '`' + $_ + '`' }) -join ', '), (($ObjectPrefixes | ForEach-Object { '`' + $_ + '`' }) -join ', '))
 W ''
 W '## Resumen'
@@ -6676,7 +6737,8 @@ W ''
 # --- 6. endpoints sin SP
 W '## 6. Endpoints sin SP asociado'
 W ''
-if ($epNoSp.Count -eq 0) { W '_Todos los endpoints tienen al menos un SP asociado._' }
+if ($endpoints.Count -eq 0) { W '_No se detectaron endpoints en la carpeta analizada._' }
+elseif ($epNoSp.Count -eq 0) { W '_Todos los endpoints tienen al menos un SP asociado._' }
 else {
     W '| Endpoint | Handler | Motivo |'
     W '|---|---|---|'
@@ -6740,6 +6802,12 @@ if ($res.ParseErrors.Count -gt 0) {
     W ''
 }
 
+if ($null -ne $swaggerError) {
+    W '## 8. Cruce con Swagger / OpenAPI'
+    W ''
+    W ("_No se pudo leer el documento ``{0}``: {1}_" -f $SwaggerPath, (Esc $swaggerError))
+    W ''
+}
 if ($null -ne $swaggerInfo) {
     W '## 8. Cruce con Swagger / OpenAPI'
     W ''
@@ -6802,6 +6870,18 @@ W '  - las carpetas `bin`, `obj`, `.git`, `node_modules` y `packages`, y las de 
 W '  - los proyectos de test y los archivos generados (`*.g.cs`, `*.Designer.cs`);'
 W '  - los `.sql` que el código C# no referencia por nombre.'
 W '- No se detectan los nombres de SP que se arman en tiempo de ejecución concatenando variables. Si se encuentra un caso así, aparece como advertencia "SP dinámico".'
+if ($skippedDirs.Count -gt 0) {
+    $sk = @($skippedDirs | Sort-Object -Unique)
+    $skTxt = (@($sk | Select-Object -First 40 | ForEach-Object { '`' + $_ + '`' }) -join ', ')
+    if ($sk.Count -gt 40) { $skTxt += " y $($sk.Count - 40) más" }
+    W ("- Carpetas excluidas en esta ejecución ({0}): {1}." -f $sk.Count, $skTxt)
+}
+if ($excludedTests -gt 0) { W ("- Archivos .cs de proyectos de test excluidos: {0} (use ``-IncludeTests`` para incluirlos)." -f $excludedTests) }
+if ($res.EncodingNotes.Count -gt 0) {
+    $enTxt = (@($res.EncodingNotes | Select-Object -First 20 | ForEach-Object { '`' + $_ + '`' }) -join ', ')
+    if ($res.EncodingNotes.Count -gt 20) { $enTxt += " y $($res.EncodingNotes.Count - 20) más" }
+    W ("- Archivos leídos como Windows-1252 (ANSI) porque no eran UTF-8 válido: {0}." -f $enTxt)
+}
 W ("- Tiempo de análisis: {0:N1} s." -f $sw.Elapsed.TotalSeconds)
 
 $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -6834,6 +6914,7 @@ if ($ExportCsv) {
         }
     }
     $csvText = ($csv | ConvertTo-Csv -NoTypeInformation -Delimiter ';') -join "`r`n"
+    if ($rows.Count -eq 0) { $csvText = '"Verbo";"Ruta";"Handler";"SP";"SpHijo";"Tipo";"EstadoHijo";"Nivel";"Forma";"Archivo";"Linea";"QueryArchivo";"QueryLinea";"Inferido";"Detalle";"Traza"' }
     [System.IO.File]::WriteAllText($csvPath, $csvText, (New-Object System.Text.UTF8Encoding($true)))
     Write-Host "  CSV         : $csvPath"
 }

@@ -126,6 +126,12 @@ $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 if ((Test-Path -LiteralPath $OutputPath -PathType Container) -or $OutputPath.EndsWith('\') -or $OutputPath.EndsWith('/') -or [string]::IsNullOrEmpty([System.IO.Path]::GetExtension($OutputPath))) {
     $OutputPath = Join-Path $OutputPath 'reporte-sp-endpoints.md'
 }
+if ([System.IO.Path]::GetExtension($OutputPath) -ne '.md') {
+    # el reporte siempre es .md (el CSV opcional se escribe al lado con el mismo nombre)
+    $newOut = [System.IO.Path]::ChangeExtension($OutputPath, '.md')
+    Write-Warning "La salida debe ser un .md: se usará '$newOut'."
+    $OutputPath = $newOut
+}
 $outDir = Split-Path -Parent $OutputPath
 if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 

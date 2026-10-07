@@ -31,11 +31,20 @@ $nl = "`n"
 $outDirFull = [System.IO.Path]::GetDirectoryName($OutputPath)
 $baseUri = New-Object System.Uri (($outDirFull.TrimEnd('\') + '\'))
 
+# texto plano en celdas: sin saltos de linea, "|" escapado y < > & como entidades (Program.<top-level>, Repo<T>)
 function Esc([string]$s) {
     if ($null -eq $s) { return '' }
-    return ($s -replace '\r?\n', ' ' -replace '\|', '\|')
+    $s = $s -replace '\r?\n', ' '
+    $s = $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;')
+    return ($s -replace '\|', '\|')
 }
-function Code([string]$s) { if ([string]::IsNullOrEmpty($s)) { return '' } return '`' + (Esc $s) + '`' }
+# span de codigo: dentro no se interpretan entidades; si el texto tiene comillas invertidas se usa doble delimitador
+function Code([string]$s) {
+    if ([string]::IsNullOrEmpty($s)) { return '' }
+    $v = ($s -replace '\r?\n', ' ') -replace '\|', '\|'
+    if ($v.Contains('`')) { return '`` ' + $v + ' ``' }
+    return '`' + $v + '`'
+}
 function LocLink($loc) {
     if ($null -eq $loc -or $null -eq $loc.File) { return '' }
     $full = $loc.File.Path
